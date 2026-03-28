@@ -16,6 +16,7 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 # Reuse SGLang's optimized RMSNorm instead of torch.nn.RMSNorm or custom SlowRMSNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -522,7 +523,10 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         self, x: torch.Tensor, control_camera_latents_input: torch.Tensor | None = None
     ):
         # NOTE(dhyu): avoid slow_conv
-        x = x.contiguous(memory_format=torch.channels_last_3d)
+        if current_platform.is_npu:
+            x = x.contiguous()
+        else:
+            x = x.contiguous(memory_format=torch.channels_last_3d)
         x = self.patch_embedding(x)
         grid_size = x.shape[2:]
         x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
