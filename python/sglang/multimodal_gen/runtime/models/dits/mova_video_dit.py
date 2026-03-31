@@ -16,7 +16,6 @@ from torch.distributed.tensor import DTensor
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.platforms import current_platform
 
 # Reuse SGLang's optimized RMSNorm instead of torch.nn.RMSNorm or custom SlowRMSNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -35,6 +34,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -522,8 +522,8 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
     def patchify(
         self, x: torch.Tensor, control_camera_latents_input: torch.Tensor | None = None
     ):
-        # torch.channels_last_3d is not supported on NPU
         if current_platform.is_npu:
+            # torch.channels_last_3d is not supported on NPU
             x = x.contiguous()
         else:
             # NOTE(dhyu): avoid slow_conv

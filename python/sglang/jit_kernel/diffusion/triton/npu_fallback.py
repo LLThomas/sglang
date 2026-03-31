@@ -30,8 +30,8 @@ def apply_rotary_embedding_native(
         and x.shape[2] < NPU_ROTARY_MUL_MAX_HEAD_SIZE
     ):
         if cos.size(-1) * 2 == x.size(-1):
-            cos = torch.cat([cos, cos], dim = -1)
-            sin = torch.cat([sin, sin], dim = -1)
+            cos = torch.cat([cos, cos], dim=-1)
+            sin = torch.cat([sin, sin], dim=-1)
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
         x = x.unsqueeze(0)
