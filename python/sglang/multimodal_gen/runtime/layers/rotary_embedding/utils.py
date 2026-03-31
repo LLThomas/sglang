@@ -7,10 +7,8 @@ import torch
 from sglang.jit_kernel.diffusion.triton.rotary import apply_rotary_embedding
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
-_is_npu = current_platform.is_npu()
 _is_cuda = current_platform.is_cuda()
 if _is_cuda:
     try:
@@ -113,15 +111,8 @@ def apply_flashinfer_rope_qk_inplace(
             sin = cos_sin_cache[positions, half_size:].to(q.dtype)
         q_flat = q.reshape(bsz * seqlen, nheads, d)
         k_flat = k.reshape(bsz * seqlen, nheads, d)
-
-        if _is_npu and is_neox:
-            cos = torch.cat([cos, cos], dim=-1)
-            sin = torch.cat([sin, sin], dim=-1)
-            q_rot, k_rot = apply_rotary_pos_emb(q_flat, k_flat, cos, sin)
-        else:
-            q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
-            k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
-
+        q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
+        k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
         return q_rot.view(bsz, seqlen, nheads, d), k_rot.view(bsz, seqlen, nheads, d)
 
     if positions is None:

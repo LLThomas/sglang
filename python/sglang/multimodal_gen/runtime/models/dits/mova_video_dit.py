@@ -522,10 +522,11 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
     def patchify(
         self, x: torch.Tensor, control_camera_latents_input: torch.Tensor | None = None
     ):
-        # NOTE(dhyu): avoid slow_conv
+        # torch.channels_last_3d is not supported on NPU
         if current_platform.is_npu:
             x = x.contiguous()
         else:
+            # NOTE(dhyu): avoid slow_conv
             x = x.contiguous(memory_format=torch.channels_last_3d)
         x = self.patch_embedding(x)
         grid_size = x.shape[2:]
