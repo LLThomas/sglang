@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
+from sglang.multimodal_gen.runtime.utils.request_logger import DiffusionRequestLogger
 
 logger = init_logger(__name__)
 
@@ -138,6 +139,14 @@ class Scheduler(SchedulerDisaggMixin):
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
 
+		# Request logging
+        self.request_logger = DiffusionRequestLogger(
+            log_requests=self.server_args.log_requests,
+            log_requests_level=self.server_args.log_requests_level,
+            log_requests_format=self.server_args.log_requests_format,
+            log_requests_target=self.server_args.log_requests_target,
+        )
+
         self._init_disagg_state(server_args, local_rank)
 
     def get_disagg_metrics(self) -> dict | None:
@@ -151,7 +160,6 @@ class Scheduler(SchedulerDisaggMixin):
         stats = self.get_disagg_metrics()
         return OutputBatch(
             output=stats or {"role": "monolithic", "message": "not in disagg mode"}
-        )
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
@@ -198,6 +206,11 @@ class Scheduler(SchedulerDisaggMixin):
     def _handle_generation(self, reqs: List[Req] | list[list[Req]]):
         if len(reqs) == 1 and isinstance(reqs[0], list):
             reqs = reqs[0]
+
+        # Log the request
+        for req in reqs:
+            self.request_logger.log_received_request(req=req)
+
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._warmup_processed += len(warmup_reqs)
@@ -501,6 +514,13 @@ class Scheduler(SchedulerDisaggMixin):
                         if isinstance(processed_req, Req)
                         else False
                     )
+
+                if isinstance(processed_req, Req):
+                    self.request_logger.log_finished_request(
+                        req=processed_req,
+                        output_batch=output_batch,
+                    )
+
                 if is_warmup:
                     if output_batch.error is None:
                         if self._warmup_total > 0:
