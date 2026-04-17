@@ -123,9 +123,7 @@ class DiffusionRequestLogger:
             target.info(msg)
 
     def _format_req_text(self, req: Any, max_length: int, skip_names: Set[str]) -> str:
-        obj_str = _dataclass_to_string_truncated(
-            req, max_length, skip_names=skip_names
-        )
+        obj_str = _dataclass_to_string_truncated(req, max_length, skip_names=skip_names)
         req_meta = _extract_req_metadata(req)
         meta_str = ", ".join(f"{k}={v!r}" for k, v in req_meta.items())
         prefix_len = len(f"{req.__class__.__name__}(")
@@ -155,7 +153,9 @@ class DiffusionRequestLogger:
             }
             log_json(self.targets, "request.received", log_data)
         else:
-            self._log(f"Receive: obj={self._format_req_text(req, max_length, skip_names)}")
+            self._log(
+                f"Receive: obj={self._format_req_text(req, max_length, skip_names)}"
+            )
 
     def log_finished_request(self, req: Any, output_batch: Any) -> None:
         if not self.log_requests:

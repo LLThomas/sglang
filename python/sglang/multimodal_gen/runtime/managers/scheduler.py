@@ -139,7 +139,7 @@ class Scheduler(SchedulerDisaggMixin):
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
 
-		# Request logging
+        # Request logging
         self.request_logger = DiffusionRequestLogger(
             log_requests=self.server_args.log_requests,
             log_requests_level=self.server_args.log_requests_level,
@@ -160,6 +160,7 @@ class Scheduler(SchedulerDisaggMixin):
         stats = self.get_disagg_metrics()
         return OutputBatch(
             output=stats or {"role": "monolithic", "message": "not in disagg mode"}
+        )
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
