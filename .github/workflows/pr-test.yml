@@ -189,7 +189,7 @@ jobs:
 
           # Check for main_package changes (excluding multimodal_gen, jit_kernel/diffusion, jit_kernel/tests/diffusion, jit_kernel/benchmark/diffusion, cli)
           # Note: Need to filter out multimodal_gen and diffusion-related paths before checking, not pipe grep -q output
-          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\\.github/workflows/pr-test\\.yml|\\.github/workflows/pr-gate\\.yml|\\.github/actions/)" | grep -v -E "^(python/sglang/multimodal_gen/|python/sglang/jit_kernel/diffusion/|python/sglang/jit_kernel/tests/diffusion/|python/sglang/jit_kernel/benchmark/diffusion/|python/sglang/cli/)" || true)
+          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v -E "^(python/sglang/multimodal_gen/|python/sglang/jit_kernel/diffusion/|python/sglang/jit_kernel/tests/diffusion/|python/sglang/jit_kernel/benchmark/diffusion/|python/sglang/cli/)" || true)
           if [ -n "$MAIN_PKG_FILES" ]; then
             echo "main_package=true" >> $GITHUB_OUTPUT
             echo "Detected main_package changes"
