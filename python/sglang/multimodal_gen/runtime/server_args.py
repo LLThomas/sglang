@@ -1120,7 +1120,6 @@ class ServerArgs(DisaggArgsMixin):
         parser.add_argument(
             "--log-requests",
             action="store_true",
-            default=ServerArgs.log_requests,
             help="Log request information for diffusion models. "
             "Only user-facing fields (prompt, sampling_params, etc.) are logged; "
             "internal tensors are always excluded. "
