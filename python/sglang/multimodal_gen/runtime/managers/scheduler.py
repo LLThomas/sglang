@@ -43,8 +43,8 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
-from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.multimodal_gen.runtime.utils.request_logger import DiffusionRequestLogger
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
 
