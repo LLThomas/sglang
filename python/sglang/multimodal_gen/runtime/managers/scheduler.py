@@ -516,9 +516,14 @@ class Scheduler(SchedulerDisaggMixin):
                         else False
                     )
 
-                if isinstance(processed_req, Req):
+                reqs_to_log = (
+                    processed_req
+                    if isinstance(processed_req, list) and processed_req
+                    else [processed_req] if isinstance(processed_req, Req) else []
+                )
+                for req in reqs_to_log:
                     self.request_logger.log_finished_request(
-                        req=processed_req,
+                        req=req,
                         output_batch=output_batch,
                     )
 
