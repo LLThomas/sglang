@@ -1,0 +1,63 @@
+from dataclasses import dataclass, field
+
+import torch
+
+from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+
+
+@dataclass
+class HunyuanImage3ArchConfig(DiTArchConfig):
+    _fsdp_shard_conditions: list = field(default_factory=list)
+    _compile_conditions: list = field(default_factory=list)
+    param_names_mapping: dict = field(default_factory=dict)
+    reverse_param_names_mapping: dict = field(default_factory=dict)
+
+    # Architecture params (from HunyuanImage-3.0 config.json)
+    hidden_size: int = 4096
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    attention_head_dim: int = 128
+    intermediate_size: int = 11008
+    patch_size: int = 1
+    in_channels: int = 32  # VAE latent_channels from config.json
+    out_channels: int = 32
+    vocab_size: int = 133120
+    image_base_size: int = 1024
+    vae_downsample_factor: tuple[int, int] = (16, 16)
+    rope_theta: float = 256.0
+    rope_axes_dim: tuple[int, int] = (64, 64)
+    qk_norm: str = "rms_norm"
+    guidance_embeds: bool = False
+    text_embed_dim: int = 3584  # Qwen2.5-VL hidden size
+    # GQA params
+    num_key_value_heads: int = 8
+    rms_norm_eps: float = 1e-5
+    attention_bias: bool = False
+    # MoE params (per-layer lists from config.json)
+    num_experts: int = 64
+    moe_topk: int = 8
+    num_shared_expert: int = 1
+    moe_layer_num_skipped: int = 0
+    use_mixed_mlp_moe: bool = True
+    moe_intermediate_size: int = 11008
+    # patch_embed / final_layer
+    patch_embed_hidden_dim: int = 1024
+    # Timestep embedders
+    timestep_embed_dim: int = 4096
+    # Special token IDs from config.json
+    bos_token_id: int = 127958
+    eos_token_id: int = 127957
+    pad_token_id: int = 128009
+    image_token_id: int = 128006
+    # lm_head config
+    tie_word_embeddings: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.num_channels_latents = self.in_channels
+
+
+@dataclass
+class HunyuanImage3DiTConfig(DiTConfig):
+    arch_config: DiTArchConfig = field(default_factory=HunyuanImage3ArchConfig)
+    prefix: str = ""
