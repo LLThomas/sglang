@@ -126,7 +126,7 @@ class TeaCacheMixin:
 
     # Models that support CFG cache separation (wan/hunyuan/zimage)
     # Models not in this set (flux/qwen) auto-disable TeaCache when CFG is enabled
-    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
+    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "hunyuanimage", "zimage"}
     config: DiTConfig
 
     def _init_teacache_state(self) -> None:

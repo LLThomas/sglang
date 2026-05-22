@@ -210,6 +210,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
+            ep_size=self.server_args.ep_size,
             distributed_init_method=NetworkAddress(
                 "127.0.0.1", self.master_port
             ).to_tcp(),

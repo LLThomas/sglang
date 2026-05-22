@@ -216,6 +216,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # data parallelism
     # number of data parallelism groups
     dp_size: int = 1
+    # expert parallelism (for MoE models)
+    ep_size: int = 1
+    # MoE backend configuration (bridged to SRT's MoE stack)
+    moe_a2a_backend: str = "none"
+    moe_runner_backend: str = "auto"
     # number of gpu in a dp group
     dp_degree: int = 1
     # cfg parallel (None = auto-decide based on num_gpus)
@@ -1087,6 +1092,14 @@ class ServerArgs(DisaggServerArgsMixin):
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
+        # Ascend FuseEP MoE: ep_size must equal tp_size
+        if self.moe_a2a_backend == "ascend_fuseep":
+            self.ep_size = self.tp_size
+            logger.info(
+                "Ascend fused EP MoE enabled, ep_size adjusted to tp_size=%d",
+                self.tp_size,
+            )
+
     def _model_default_uses_cfg(self) -> bool:
         """
         Check whether the model uses classifier-free guidance by default.
@@ -1463,6 +1476,36 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.dp_size,
             help="The data parallelism size.",
+        )
+        parser.add_argument(
+            "--expert-parallel-size",
+            "--ep-size",
+            type=int,
+            dest="ep_size",
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size for MoE models.",
+        )
+        parser.add_argument(
+            "--moe-a2a-backend",
+            type=str,
+            choices=[
+                "none", "deepep", "mooncake", "nixl", "mori",
+                "ascend_fuseep", "flashinfer", "megamoe",
+            ],
+            default=ServerArgs.moe_a2a_backend,
+            help="Choose the backend for MoE A2A.",
+        )
+        parser.add_argument(
+            "--moe-runner-backend",
+            type=str,
+            choices=[
+                "auto", "deep_gemm", "triton", "triton_kernel",
+                "flashinfer_trtllm", "flashinfer_trtllm_routed",
+                "flashinfer_cutlass", "flashinfer_mxfp4",
+                "flashinfer_cutedsl", "cutlass", "aiter", "marlin",
+            ],
+            default=ServerArgs.moe_runner_backend,
+            help="Choose the runner backend for MoE.",
         )
 
         parser.add_argument(
@@ -2225,6 +2268,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "cfg_parallel_size": "cfg_parallel_degree",
             "data_parallel_size": "dp_size",
             "dp": "dp_size",
+            "expert_parallel_size": "ep_size",
             "layerwise_offload_modules": "layerwise_offload_components",
             "mode": "performance_mode",
         }

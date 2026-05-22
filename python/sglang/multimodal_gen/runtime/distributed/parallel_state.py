@@ -306,7 +306,6 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
-# xDiT
 def initialize_model_parallel(
     data_parallel_size: int = 1,
     classifier_free_guidance_degree: int = 1,
@@ -480,7 +479,6 @@ def initialize_model_parallel(
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
 
-
 def get_sp_world_size() -> int:
     """Return world size for the sequence model parallel group."""
     return get_sp_group().world_size
@@ -518,6 +516,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     dp_size: int = 1,
+    ep_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
 ):
@@ -561,6 +560,16 @@ def maybe_init_distributed_environment_and_model_parallel(
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
     )
+
+    # Initialize SRT parallel groups so that diffusion MoE models can
+    # directly use SRT's FusedMoE / TopK layers.  This is lightweight —
+    # when ep_size=1 the MoE groups simply alias to _TP.  The MoE config
+    # globals (MOE_A2A_BACKEND, MOE_RUNNER_BACKEND, etc.) are initialized
+    # lazily when the model actually creates a FusedMoE instance.
+    from sglang.multimodal_gen.runtime.distributed.srt_moe_bridge import (
+        init_srt_parallel_groups,
+    )
+    init_srt_parallel_groups(tp_size=tp_size, ep_size=ep_size)
 
     # Only set CUDA device if we're on a CUDA platform
     if current_platform.is_cuda_alike():
@@ -910,3 +919,24 @@ def destroy_model_parallel() -> None:
             torch.distributed.destroy_process_group(group)
 
     _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE = (None,) * 8
+
+    # Destroy srt MoE parallel groups that were initialised by
+    # ``_init_srt_moe_parallel_groups``.  We only tear down the groups
+    # we created; if srt's own ``initialize_model_parallel`` was called
+    # separately, srt's ``destroy_model_parallel`` handles those.
+    try:
+        import sglang.srt.distributed.parallel_state as srt_ps
+
+        # _MOE_EP aliases _TP, so only destroy _TP once.
+        if srt_ps._MOE_TP is not None and srt_ps._MOE_TP is not srt_ps._TP:
+            srt_ps._MOE_TP.destroy()
+        if srt_ps._TP is not None:
+            srt_ps._TP.destroy()
+        srt_ps._MOE_EP = None
+        srt_ps._MOE_TP = None
+        srt_ps._TP = None
+        if srt_ps._WORLD is not None:
+            srt_ps._WORLD.destroy()
+            srt_ps._WORLD = None
+    except ImportError:
+        pass
