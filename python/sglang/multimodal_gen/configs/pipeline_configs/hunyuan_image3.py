@@ -13,7 +13,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 
 @dataclass
 class HunyuanImage3PipelineConfig(ImagePipelineConfig):
-    """Pipeline config for HunyuanImage-3.0 (DiT-only mode)."""
+    """Pipeline config for HunyuanImage-3.0 (Hybrid style).
+
+    AR generation is controlled at runtime by ``batch.bot_task`` and
+    consolidated into BeforeDenoisingStage, not via a pipeline-level flag.
+    """
 
     task_type: ModelTaskType = ModelTaskType.T2I
     vae_precision: str = "fp16"
@@ -21,7 +25,6 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
     vae_tiling: bool = False
     enable_autocast: bool = False
     flow_shift: float = 3.0
-    enable_ar_stage: bool = False  # whether to run AR before denoising
     tie_word_embeddings: bool = False  # official default is False
 
     dit_config: DiTConfig = field(default_factory=HunyuanImage3DiTConfig)
@@ -49,7 +52,7 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         # 注意：encoder_hidden_states 由 get_pos_prompt_embeds() 处理
         # 不要在此设置，因为 DenoisingStage 合并时会被覆盖
-        return {
+        kwargs = {
             "encoder_attention_mask": batch.encoder_attention_mask,
             "image_mask": batch.image_mask,
             "timestep_scatter_index": batch.gen_timestep_scatter_index
@@ -63,6 +66,17 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
             "token_h": batch.token_h,
             "token_w": batch.token_w,
         }
+        # Pass cond_vae_images and cond_timestep for TI2I
+        if hasattr(batch, "cond_vae_images") and batch.cond_vae_images is not None:
+            kwargs["cond_vae_images"] = batch.cond_vae_images
+        if hasattr(batch, "cond_timestep") and batch.cond_timestep is not None:
+            kwargs["cond_timestep"] = batch.cond_timestep
+        if (
+            hasattr(batch, "cond_timestep_scatter_index")
+            and batch.cond_timestep_scatter_index is not None
+        ):
+            kwargs["cond_timestep_scatter_index"] = batch.cond_timestep_scatter_index
+        return kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         # 注意：encoder_hidden_states 由 get_neg_prompt_embeds() 处理
@@ -111,4 +125,16 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
         """
         if frames.ndim == 5 and frames.shape[2] == 1:
             frames = frames.squeeze(2)  # (B, C, 1, H, W) -> (B, C, H, W)
-        return frames
+        return frames
+
+
+@dataclass
+class HunyuanImage3TI2IPipelineConfig(HunyuanImage3PipelineConfig):
+    """Pipeline config for HunyuanImage-3.0 TI2I (Text & Image to Image).
+
+    Same as T2I config but with TI2I task type so ``image_path`` is
+    accepted by SamplingParams validation.  The TI2I mode enables
+    conditional image input (cond VAE + ViT embeddings).
+    """
+
+    task_type: ModelTaskType = ModelTaskType.TI2I

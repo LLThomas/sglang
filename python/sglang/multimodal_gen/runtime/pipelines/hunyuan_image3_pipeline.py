@@ -29,7 +29,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3 import (
     HunyuanImage3BeforeDenoisingStage,
-    HunyuanImage3TextGenerationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -220,6 +219,85 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             shift=flow_shift,
         )
 
+        # --- Image Encoder (SigLIP2 + LightProjector) for TI2I ---
+        # Only load if the pipeline config requires image input (TI2I mode)
+        task_type = getattr(server_args.pipeline_config, "task_type", None)
+        if task_type is not None and task_type.accepts_image_input():
+            from sglang.multimodal_gen.runtime.loader.weight_utils import (
+                default_weight_loader,
+                safetensors_weights_iterator,
+            )
+            from sglang.multimodal_gen.runtime.models.encoders.siglip2 import (
+                LightProjector,
+                Siglip2VisionTransformer,
+            )
+
+            # Read HF config for vit and vit_aligner configs
+            from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+                get_diffusers_component_config,
+            )
+
+            hf_config = get_diffusers_component_config(local_model_path)
+
+            # Load SigLIP2 vision model
+            vit_config = hf_config.get("vit", None)
+            vit_aligner_config = hf_config.get("vit_aligner", None)
+
+            image_encoder = None
+            if vit_config is not None:
+                vision_model = Siglip2VisionTransformer(vit_config)
+                vision_aligner = None
+                if vit_aligner_config is not None:
+                    vision_aligner = LightProjector(vit_aligner_config)
+
+                # Load weights from shared safetensors
+                safetensors_files = sorted(
+                    glob.glob(os.path.join(local_model_path, "*.safetensors"))
+                )
+                if safetensors_files:
+                    vision_model = vision_model.to(device=device, dtype=torch.bfloat16)
+                    if vision_aligner is not None:
+                        vision_aligner = vision_aligner.to(
+                            device=device, dtype=torch.bfloat16
+                        )
+
+                    vm_params = dict(vision_model.named_parameters())
+                    va_params = (
+                        dict(vision_aligner.named_parameters())
+                        if vision_aligner is not None
+                        else {}
+                    )
+                    loaded_vm: set[str] = set()
+                    loaded_va: set[str] = set()
+
+                    for name, tensor in safetensors_weights_iterator(safetensors_files):
+                        if name.startswith("vision_model."):
+                            stripped = name[len("vision_model."):]
+                            if stripped in vm_params:
+                                default_weight_loader(vm_params[stripped], tensor)
+                                loaded_vm.add(stripped)
+                        elif name.startswith("vision_aligner."):
+                            stripped = name[len("vision_aligner."):]
+                            if stripped in va_params:
+                                default_weight_loader(va_params[stripped], tensor)
+                                loaded_va.add(stripped)
+
+                    logger.info(
+                        "Loaded %d/%d vision_model, %d/%d vision_aligner parameters",
+                        len(loaded_vm),
+                        len(vm_params),
+                        len(loaded_va),
+                        len(va_params),
+                    )
+
+                image_encoder = {
+                    "vision_model": vision_model,
+                    "vision_aligner": vision_aligner,
+                    "vit_processor_config": hf_config.get("vit_processor", None),
+                }
+
+            components["image_encoder"] = image_encoder
+
         logger.info(
             "HunyuanImage3Pipeline loaded all components from %s",
             local_model_path,
@@ -231,22 +309,17 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
     # ------------------------------------------------------------------
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        # Conditionally add AR stage (before BeforeDenoising)
-        if getattr(server_args.pipeline_config, "enable_ar_stage", False):
-            self.add_stage(
-                HunyuanImage3TextGenerationStage(
-                    transformer=self.get_module("transformer"),
-                    tokenizer=self.get_module("tokenizer"),
-                ),
-                "hunyuan_image3_text_generation_stage",
-            )
-
+        # AR generation is consolidated into BeforeDenoisingStage (Hybrid style).
+        # When batch.bot_task is set, AR runs as the first sub-step inside
+        # BeforeDenoisingStage; no separate stage is needed.
+        image_encoder = self.get_module("image_encoder", None)
         self.add_stage(
             HunyuanImage3BeforeDenoisingStage(
                 vae=self.get_module("vae"),
                 transformer=self.get_module("transformer"),
                 tokenizer=self.get_module("tokenizer"),
                 scheduler=self.get_module("scheduler"),
+                image_encoder=image_encoder,
             ),
             "hunyuan_image3_before_denoising_stage",
         )

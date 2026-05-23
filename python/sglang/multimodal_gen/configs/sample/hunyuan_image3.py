@@ -22,4 +22,5 @@ class HunyuanImage3SamplingParams(SamplingParams):
     ar_top_p: float = 1.0  # AR top-p
     ar_top_k: int = 1  # AR top-k (1 = greedy)
     drop_think: bool = False  # drop think portion from CoT
-    image_size: str = "auto"  # "auto" = predict ratio via AR, or "HxW"
+    image_size: str = "auto"  # "auto" = predict ratio via AR, or "HxW"
+    sys_type: str = "dynamic"  # system prompt type: "None", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "dynamic", "custom"
