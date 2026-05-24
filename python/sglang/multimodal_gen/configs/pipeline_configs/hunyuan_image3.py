@@ -24,6 +24,7 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
     should_use_guidance: bool = True
     vae_tiling: bool = False
     enable_autocast: bool = False
+    vae_sp: bool = False
     flow_shift: float = 3.0
     tie_word_embeddings: bool = False  # official default is False
 
@@ -137,4 +138,4 @@ class HunyuanImage3TI2IPipelineConfig(HunyuanImage3PipelineConfig):
     conditional image input (cond VAE + ViT embeddings).
     """
 
-    task_type: ModelTaskType = ModelTaskType.TI2I
+    task_type: ModelTaskType = ModelTaskType.TI2I

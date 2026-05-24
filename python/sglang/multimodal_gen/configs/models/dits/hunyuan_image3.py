@@ -9,8 +9,26 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 class HunyuanImage3ArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=list)
     _compile_conditions: list = field(default_factory=list)
-    param_names_mapping: dict = field(default_factory=dict)
-    reverse_param_names_mapping: dict = field(default_factory=dict)
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            # Strip leading "model." prefix used by HF transformers format
+            r"^model\.(.*)$": r"\1",
+            # HF uses "gate_and_up_proj"; sglang model uses "gate_up_proj"
+            r"(.*)\.gate_and_up_proj\.(.*)": r"\1.gate_up_proj.\2",
+            # HF uses "ln_f"; sglang model uses "norm"
+            r"^ln_f\.": r"norm.",
+            # HF uses "wte"; sglang model uses "embed_tokens"
+            r"^wte\.": r"embed_tokens.",
+            # HF uses "mlp.gate.wg"; sglang model uses "mlp.gate"
+            r"(.*)\.mlp\.gate\.wg\.(.*)": r"\1.mlp.gate.\2",
+        }
+    )
+    reverse_param_names_mapping: dict = field(
+        default_factory=lambda: {
+            # Add back "model." prefix for HF format
+            r"^(.*)$": r"model.\1",
+        }
+    )
 
     # Architecture params (from HunyuanImage-3.0 config.json)
     hidden_size: int = 4096
@@ -60,4 +78,4 @@ class HunyuanImage3ArchConfig(DiTArchConfig):
 @dataclass
 class HunyuanImage3DiTConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=HunyuanImage3ArchConfig)
-    prefix: str = ""
+    prefix: str = ""

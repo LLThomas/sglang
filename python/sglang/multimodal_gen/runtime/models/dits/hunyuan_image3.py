@@ -10,7 +10,6 @@
 
 import logging
 import math
-from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
@@ -23,7 +22,6 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DiTConfig,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 logger = logging.getLogger(__name__)
@@ -755,9 +753,7 @@ class HunYuanAttention(nn.Module):
         self.scaling = head_dim**-0.5
         self.use_qk_norm = use_qk_norm
 
-        self.q_proj = nn.Linear(hidden_size, self.q_size, bias=bias)
-        self.k_proj = nn.Linear(hidden_size, self.kv_size, bias=bias)
-        self.v_proj = nn.Linear(hidden_size, self.kv_size, bias=bias)
+        self.qkv_proj = nn.Linear(hidden_size, self.q_size + 2 * self.kv_size, bias=bias)
         self.o_proj = nn.Linear(self.q_size, hidden_size, bias=bias)
 
         if self.use_qk_norm:
@@ -772,9 +768,8 @@ class HunYuanAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Reshape: [B, L, D] -> [B, L, H, D_h] -> [B, H, L, D_h]
         q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -1377,149 +1372,5 @@ class HunyuanImage3DiT(CachableDiT):
         # This method is a placeholder; actual mapping is in the stage.
         return 0
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """
-        Load weights from a Diffusers-format checkpoint.
 
-        Maps Diffusers weight names to the model's parameter names,
-        handling the stacked qkv and gate_up projections.
-        """
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".q_proj", ".q_proj", "q"),
-            (".k_proj", ".k_proj", "k"),
-            (".v_proj", ".v_proj", "v"),
-        ]
-
-        # In the vllm-omni source, q/k/v are fused into a single qkv_proj.
-        # In our single-GPU impl they are separate nn.Linear, so we load
-        # each shard directly into the corresponding proj.
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        # Prefix mapping: Diffusers stores weights under "model." prefix
-        # for the transformer backbone; our model flattens that.
-        prefix_mapping = {
-            "model.": "",
-        }
-
-        # Names to skip
-        skip_keywords = [
-            "rotary_emb.inv_freq",
-            "rotary_emb.cos_cached",
-            "rotary_emb.sin_cached",
-        ]
-
-        for name, loaded_weight in weights:
-            # Apply prefix mapping
-            for old_prefix, new_prefix in prefix_mapping.items():
-                if name.startswith(old_prefix):
-                    name = new_prefix + name[len(old_prefix):]
-                    break
-
-            # Skip known non-parameter tensors
-            if any(kw in name for kw in skip_keywords):
-                continue
-
-            # Handle qkv_proj -> separate q/k/v projections
-            # In Diffusers format, the weights come as separate q/k/v already
-            # or as a fused qkv_proj. We handle both cases.
-            if ".qkv_proj." in name:
-                # Fused qkv: split and load separately
-                base_name = name.replace(".qkv_proj.", ".")
-                weight_name_suffix = name.split(".")[-1]  # "weight" or "bias"
-
-                num_heads = self.num_attention_heads
-                num_kv_heads = self.num_kv_heads
-                head_dim = self.head_dim
-                hidden_size = self.hidden_size
-
-                q_size = num_heads * head_dim
-                kv_size = num_kv_heads * head_dim
-
-                if weight_name_suffix == "weight":
-                    q_w, k_w, v_w = loaded_weight.split(
-                        [q_size, q_size + kv_size], dim=0
-                    )
-                    for proj_name, proj_weight in [
-                        ("q_proj", q_w),
-                        ("k_proj", k_w),
-                        ("v_proj", v_w),
-                    ]:
-                        param_name = base_name + proj_name + ".weight"
-                        if param_name in params_dict:
-                            default_weight_loader(params_dict[param_name], proj_weight)
-                            loaded_params.add(param_name)
-                elif weight_name_suffix == "bias":
-                    q_b, k_b, v_b = loaded_weight.split(
-                        [q_size, q_size + kv_size], dim=0
-                    )
-                    for proj_name, proj_bias in [
-                        ("q_proj", q_b),
-                        ("k_proj", k_b),
-                        ("v_proj", v_b),
-                    ]:
-                        param_name = base_name + proj_name + ".bias"
-                        if param_name in params_dict:
-                            default_weight_loader(params_dict[param_name], proj_bias)
-                            loaded_params.add(param_name)
-                continue
-
-            # Handle gate_up_proj (fused gate + up projection)
-            if ".gate_up_proj." in name:
-                # Our HunYuanMLP has gate_up_proj as a single nn.Linear
-                # with 2*intermediate_size output. If the checkpoint has
-                # them fused, load directly. If separate, combine them.
-                if name in params_dict:
-                    default_weight_loader(params_dict[name], loaded_weight)
-                    loaded_params.add(name)
-                continue
-
-            # Handle separate gate_proj / up_proj -> gate_up_proj
-            if ".gate_proj." in name or ".up_proj." in name:
-                # Check if we need to fuse into gate_up_proj
-                mlp_name = name.replace(".gate_proj.", ".gate_up_proj.").replace(
-                    ".up_proj.", ".gate_up_proj."
-                )
-                if mlp_name in params_dict:
-                    # These need to be fused. We'll collect them separately
-                    # and handle in a second pass if needed. For now, skip
-                    # since the primary checkpoint format uses fused weights.
-                    pass
-                # Also try loading directly (some weights may have separate gate/up)
-                if name in params_dict:
-                    default_weight_loader(params_dict[name], loaded_weight)
-                    loaded_params.add(name)
-                continue
-
-            # Skip weights not in our model
-            if name not in params_dict:
-                # Try common remappings
-                if name == "ln_f.weight":
-                    name = "norm.weight"
-                elif name == "wte.weight":
-                    name = "embed_tokens.weight"
-                elif "mlp.gate.wg." in name:
-                    name = name.replace("mlp.gate.wg.", "mlp.gate.")
-
-                # lm_head: skip if tied (weight is alias of embed_tokens)
-                if name == "lm_head.weight" and getattr(
-                    self.config.arch_config, "tie_word_embeddings", False
-                ):
-                    loaded_params.add(name)
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-            # Default loading
-            default_weight_loader(params_dict[name], loaded_weight)
-            loaded_params.add(name)
-
-        return loaded_params
-
-
-EntryClass = HunyuanImage3DiT
+EntryClass = HunyuanImage3DiT
