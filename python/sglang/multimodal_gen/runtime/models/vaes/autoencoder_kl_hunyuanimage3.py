@@ -418,7 +418,7 @@ class AutoencoderKLConv3D(ParallelTiledVAE):
             self.decoder = Decoder(
                 z_channels=arch.latent_channels,
                 out_channels=arch.out_channels,
-                block_out_channels=arch.block_out_channels,
+                block_out_channels=list(reversed(arch.block_out_channels)),
                 num_res_blocks=arch.layers_per_block,
                 ffactor_spatial=arch.ffactor_spatial,
                 ffactor_temporal=arch.ffactor_temporal,
@@ -447,4 +447,4 @@ class AutoencoderKLConv3D(ParallelTiledVAE):
             module.gradient_checkpointing = value
 
 
-EntryClass = AutoencoderKLConv3D
+EntryClass = AutoencoderKLConv3D
