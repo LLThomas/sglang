@@ -20,6 +20,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from diffusers.utils.torch_utils import randn_tensor
+from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
@@ -33,10 +34,52 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    VerificationResult,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+class HunyuanImage3DenoisingStage(DenoisingStage):
+    """Denoising stage with Ascend-safe validation for HunyuanImage3 timesteps."""
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+
+        def timesteps_no_sync(value: Any) -> bool:
+            return isinstance(value, torch.Tensor) and value.dim() >= 1
+
+        result.add_check("timesteps", batch.timesteps, timesteps_no_sync)
+        result.add_check(
+            "prompt_embeds",
+            batch.prompt_embeds,
+            self._get_prompt_embeds_validator(batch),
+        )
+        result.add_check("image_embeds", batch.image_embeds, V.is_list)
+        result.add_check(
+            "num_inference_steps", batch.num_inference_steps, V.positive_int
+        )
+        result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
+        result.add_check("eta", batch.eta, V.non_negative_float)
+        result.add_check("generator", batch.generator, V.generator_or_list_generators)
+        result.add_check(
+            "do_classifier_free_guidance",
+            batch.do_classifier_free_guidance,
+            V.bool_value,
+        )
+        result.add_check(
+            "negative_prompt_embeds",
+            batch.negative_prompt_embeds,
+            self._get_negative_prompt_embeds_validator(batch),
+        )
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -50,12 +93,15 @@ class TokenizerOutput:
 
     tokens: torch.Tensor  # [seq_len] token IDs
     image_mask: torch.Tensor  # [seq_len] bool mask for <img> positions
+    image_scatter_index: torch.Tensor | None  # positions of gen image tokens
     timestep_scatter_index: torch.Tensor | None  # positions of all <timestep> tokens
     gen_timestep_scatter_index: torch.Tensor | None  # positions of gen <timestep> tokens
     cond_timestep_scatter_index: torch.Tensor | None  # positions of cond <timestep> tokens
     guidance_scatter_index: torch.Tensor | None  # positions of <guidance> tokens
     cond_vae_image_mask: torch.Tensor | None  # mask for conditional VAE image (I2I)
+    cond_vae_scatter_index: torch.Tensor | None  # positions of conditional VAE tokens
     cond_vit_image_mask: torch.Tensor | None  # mask for conditional ViT image (I2I)
+    cond_vit_scatter_index: torch.Tensor | None  # positions of conditional ViT tokens
     text_mask: torch.Tensor | None  # float mask for text positions
     gen_image_slices: list | None  # slice objects for gen image regions
     all_image_slices: list | None  # slice objects for all image regions
@@ -449,6 +495,7 @@ class HunyuanImage3Tokenizer:
         gen_image_slices, gen_image_mask = self._parse_image_slices(
             extra_token_pos, "img", full_seq_tensor
         )
+        gen_image_scatter_index = self._slices_to_index(gen_image_slices)
 
         # All image slices
         all_image_slices = (
@@ -465,12 +512,14 @@ class HunyuanImage3Tokenizer:
         )
 
         # Conditional vae/vit image masks (for I2I)
-        _, cond_vae_image_mask = self._parse_image_slices(
+        cond_vae_image_slices, cond_vae_image_mask = self._parse_image_slices(
             extra_token_pos, "vae_img", full_seq_tensor
         )
-        _, cond_vit_image_mask = self._parse_image_slices(
+        cond_vae_scatter_index = self._slices_to_index(cond_vae_image_slices)
+        cond_vit_image_slices, cond_vit_image_mask = self._parse_image_slices(
             extra_token_pos, "vit_img", full_seq_tensor
         )
+        cond_vit_scatter_index = self._slices_to_index(cond_vit_image_slices)
 
         # Text mask
         text_slices = (
@@ -500,12 +549,15 @@ class HunyuanImage3Tokenizer:
         return TokenizerOutput(
             tokens=full_seq_tensor,
             image_mask=gen_image_mask,
+            image_scatter_index=gen_image_scatter_index,
             timestep_scatter_index=timestep_scatter_index,
             gen_timestep_scatter_index=gen_timestep_scatter_index,
             cond_timestep_scatter_index=cond_timestep_scatter_index,
             guidance_scatter_index=guidance_scatter_index,
             cond_vae_image_mask=cond_vae_image_mask,
+            cond_vae_scatter_index=cond_vae_scatter_index,
             cond_vit_image_mask=cond_vit_image_mask,
+            cond_vit_scatter_index=cond_vit_scatter_index,
             text_mask=text_mask,
             gen_image_slices=gen_image_slices,
             all_image_slices=all_image_slices,
@@ -628,8 +680,7 @@ class HunyuanImage3Tokenizer:
 
         return token_seq, extra_token_pos
 
-    @staticmethod
-    def _parse_image_slices(extra_token_pos, prefix, tokens):
+    def _parse_image_slices(self, extra_token_pos, prefix, tokens):
         """Parse image slices and mask from extra_token_pos."""
         start_key = f"<{prefix}>_start" if prefix == "img" else f"<{prefix}_start>"
         end_key = f"<{prefix}>_end" if prefix == "img" else f"<{prefix}_end>"
@@ -649,6 +700,18 @@ class HunyuanImage3Tokenizer:
         else:
             image_mask = None
         return image_slices, image_mask
+
+    @staticmethod
+    def _slices_to_index(image_slices):
+        if not image_slices:
+            return None
+        return torch.cat(
+            [
+                torch.arange(image_slice.start, image_slice.stop, dtype=torch.long)
+                for image_slice in image_slices
+            ],
+            dim=0,
+        )
 
     def build_ar_sequence(
         self,
@@ -1076,6 +1139,61 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
                 memory_intensive=True,
             ),
         ]
+
+    def _manage_transformer_use(self) -> None:
+        manager = self._component_residency_manager
+        if manager is None:
+            return
+        use = self._declared_component_use(component_name="transformer")
+        manager.begin_use(use, module=self.transformer)
+
+    def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        is_fsdp_root = isinstance(self.transformer, FSDPModule)
+        if is_fsdp_root:
+            self.transformer.unshard()
+        try:
+            return self.transformer.embed_tokens(tokens)
+        finally:
+            if is_fsdp_root:
+                self.transformer.reshard()
+
+    @staticmethod
+    def _build_rope_image_infos(
+        tokenizer_output: TokenizerOutput,
+        token_h: int,
+        token_w: int,
+        is_ti2i: bool,
+        cond_image_infos,
+    ):
+        if not tokenizer_output.all_image_slices:
+            return None
+        if is_ti2i and cond_image_infos is not None:
+            rope_image_infos = []
+            slice_idx = 0
+            for info in cond_image_infos:
+                if slice_idx < len(tokenizer_output.all_image_slices):
+                    s = tokenizer_output.all_image_slices[slice_idx]
+                    rope_image_infos.append((s, (info["vae_token_h"], info["vae_token_w"])))
+                    slice_idx += 1
+            if slice_idx < len(tokenizer_output.all_image_slices):
+                s = tokenizer_output.all_image_slices[slice_idx]
+                rope_image_infos.append((s, (token_h, token_w)))
+            return [rope_image_infos]
+        return [[(s, (token_h, token_w)) for s in tokenizer_output.all_image_slices]]
+
+    @staticmethod
+    def _build_encoder_attention_mask(
+        seq_len: int,
+        image_slices: list,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        attention_mask = torch.ones(
+            seq_len, seq_len, device=device, dtype=torch.bool
+        ).tril(diagonal=0)
+        for img_slice in image_slices or []:
+            attention_mask[img_slice, img_slice] = True
+        return attention_mask.unsqueeze(0).unsqueeze(0)
 
     # ------------------------------------------------------------------
     # AR generation (conditional sub-step)
@@ -1631,6 +1749,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Process batch and populate all fields needed by DenoisingStage."""
+        self._manage_transformer_use()
         device = get_local_torch_device()
         dtype = torch.bfloat16
 
@@ -1757,80 +1876,98 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
         # 7. Get token embeddings via transformer.embed_tokens
         cond_tokens = cond_output.tokens.unsqueeze(0).to(device)  # [1, seq_len]
-        cond_embeds = self.transformer.embed_tokens(cond_tokens)  # [1, seq_len, hidden_size]
+        cond_embeds = self._embed_tokens(cond_tokens)  # [1, seq_len, hidden_size]
 
         if do_cfg:
             uncond_tokens = uncond_output.tokens.unsqueeze(0).to(device)
-            uncond_embeds = self.transformer.embed_tokens(uncond_tokens)
+            uncond_embeds = self._embed_tokens(uncond_tokens)
 
         # 8. Build 2D RoPE
-        # Find the image region in the token sequence for RoPE
-        image_infos = None
-        if cond_output.all_image_slices:
-            if is_ti2i and cond_image_infos is not None:
-                # For TI2I: each image slice needs its own (token_h, token_w)
-                # all_image_slices includes both joint_image and gen_image slices
-                rope_image_infos = []
-                slice_idx = 0
-                # Joint image slices (VAE + ViT for each cond image)
-                for info in cond_image_infos:
-                    # VAE image slice
-                    if slice_idx < len(cond_output.all_image_slices):
-                        s = cond_output.all_image_slices[slice_idx]
-                        # This might be a combined slice for vae+vit in joint_image
-                        rope_image_infos.append((s, (info["vae_token_h"], info["vae_token_w"])))
-                        slice_idx += 1
-                # Gen image slice
-                if slice_idx < len(cond_output.all_image_slices):
-                    s = cond_output.all_image_slices[slice_idx]
-                    rope_image_infos.append((s, (token_h, token_w)))
-                image_infos = [rope_image_infos]
-            else:
-                image_infos = [
-                    [(s, (token_h, token_w)) for s in cond_output.all_image_slices]
-                ]
-
         seq_len = cond_tokens.shape[1]
         n_elem = dit_config.rope_axes_dim[0] + dit_config.rope_axes_dim[1]  # 128
         rope_cos, rope_sin = build_batch_2d_rope(
             seq_len=seq_len,
             n_elem=n_elem,
-            image_infos=image_infos,
+            image_infos=self._build_rope_image_infos(
+                cond_output,
+                token_h,
+                token_w,
+                is_ti2i,
+                cond_image_infos,
+            ),
             device=device,
             base=dit_config.rope_theta,
         )
         rope_2d = (rope_cos, rope_sin)
+        if do_cfg:
+            neg_seq_len = uncond_tokens.shape[1]
+            neg_rope_cos, neg_rope_sin = build_batch_2d_rope(
+                seq_len=neg_seq_len,
+                n_elem=n_elem,
+                image_infos=self._build_rope_image_infos(
+                    uncond_output,
+                    token_h,
+                    token_w,
+                    is_ti2i,
+                    cond_image_infos,
+                ),
+                device=device,
+                base=dit_config.rope_theta,
+            )
+            neg_rope_2d = (neg_rope_cos, neg_rope_sin)
 
         # 9. Build position IDs
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+        if do_cfg:
+            neg_position_ids = torch.arange(neg_seq_len, device=device).unsqueeze(0)
 
         # 10. Build hybrid attention mask (causal for text, bidirectional for image)
         # Official approach: start with lower-triangular causal mask, then set
         # image token positions to True (bidirectional within image regions).
-        attention_mask = torch.ones(
-            seq_len, seq_len, device=device, dtype=torch.bool
-        ).tril(diagonal=0)
-        # Set image regions to bidirectional attention
-        if cond_output.all_image_slices:
-            for img_slice in cond_output.all_image_slices:
-                attention_mask[img_slice, img_slice] = True
-        # Expand to [1, 1, seq_len, seq_len] for SDPA
-        encoder_attention_mask = attention_mask.unsqueeze(0).unsqueeze(0).to(dtype)
+        encoder_attention_mask = self._build_encoder_attention_mask(
+            seq_len, cond_output.all_image_slices, device, dtype
+        )
         if do_cfg:
-            neg_encoder_attention_mask = encoder_attention_mask.clone()
+            neg_encoder_attention_mask = self._build_encoder_attention_mask(
+                neg_seq_len, uncond_output.all_image_slices, device, dtype
+            )
 
         # 11. Prepare image masks and scatter indices
         image_mask = cond_output.image_mask.unsqueeze(0).to(device)  # [1, seq_len]
+        image_scatter_index = (
+            cond_output.image_scatter_index.unsqueeze(0).to(device)
+            if cond_output.image_scatter_index is not None
+            else None
+        )
+        if do_cfg:
+            neg_image_mask = uncond_output.image_mask.unsqueeze(0).to(device)
+            neg_image_scatter_index = (
+                uncond_output.image_scatter_index.unsqueeze(0).to(device)
+                if uncond_output.image_scatter_index is not None
+                else None
+            )
         timestep_scatter_index = (
             cond_output.timestep_scatter_index.unsqueeze(0).to(device)
             if cond_output.timestep_scatter_index is not None
             else None
         )
+        if do_cfg:
+            neg_timestep_scatter_index = (
+                uncond_output.timestep_scatter_index.unsqueeze(0).to(device)
+                if uncond_output.timestep_scatter_index is not None
+                else None
+            )
         gen_timestep_scatter_index = (
             cond_output.gen_timestep_scatter_index.unsqueeze(0).to(device)
             if cond_output.gen_timestep_scatter_index is not None
             else None
         )
+        if do_cfg:
+            neg_gen_timestep_scatter_index = (
+                uncond_output.gen_timestep_scatter_index.unsqueeze(0).to(device)
+                if uncond_output.gen_timestep_scatter_index is not None
+                else None
+            )
         cond_timestep_scatter_index = (
             cond_output.cond_timestep_scatter_index.unsqueeze(0).to(device)
             if cond_output.cond_timestep_scatter_index is not None
@@ -1841,9 +1978,19 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             if cond_output.cond_vae_image_mask is not None
             else None
         )
+        cond_vae_scatter_index = (
+            cond_output.cond_vae_scatter_index.unsqueeze(0).to(device)
+            if cond_output.cond_vae_scatter_index is not None
+            else None
+        )
         cond_vit_image_mask = (
             cond_output.cond_vit_image_mask.unsqueeze(0).to(device)
             if cond_output.cond_vit_image_mask is not None
+            else None
+        )
+        cond_vit_scatter_index = (
+            cond_output.cond_vit_scatter_index.unsqueeze(0).to(device)
+            if cond_output.cond_vit_scatter_index is not None
             else None
         )
 
@@ -1882,11 +2029,21 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         if do_cfg:
             batch.neg_encoder_attention_mask = neg_encoder_attention_mask
         batch.image_mask = image_mask
+        batch.image_scatter_index = image_scatter_index
+        if do_cfg:
+            batch.neg_image_mask = neg_image_mask
+            batch.neg_image_scatter_index = neg_image_scatter_index
         batch.timestep_scatter_index = timestep_scatter_index
+        if do_cfg:
+            batch.neg_timestep_scatter_index = neg_timestep_scatter_index
         batch.gen_timestep_scatter_index = gen_timestep_scatter_index
+        if do_cfg:
+            batch.neg_gen_timestep_scatter_index = neg_gen_timestep_scatter_index
         batch.cond_timestep_scatter_index = cond_timestep_scatter_index
         batch.cond_vae_image_mask = cond_vae_image_mask
+        batch.cond_vae_scatter_index = cond_vae_scatter_index
         batch.cond_vit_image_mask = cond_vit_image_mask
+        batch.cond_vit_scatter_index = cond_vit_scatter_index
         batch.cond_vit_embeds = cond_vit_embeds  # ViT embeddings for TI2I
         # TI2I condition fields
         if cond_vae_images is not None:
@@ -1894,7 +2051,11 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         if cond_timestep is not None:
             batch.cond_timestep = cond_timestep
         batch.rope_2d = rope_2d
+        if do_cfg:
+            batch.neg_rope_2d = neg_rope_2d
         batch.position_ids = position_ids
+        if do_cfg:
+            batch.neg_position_ids = neg_position_ids
         batch.token_h = token_h
         batch.token_w = token_w
 
@@ -1902,4 +2063,4 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         batch.width = target_w
         batch.raw_latent_shape = latents.shape
 
-        return batch
+        return batch

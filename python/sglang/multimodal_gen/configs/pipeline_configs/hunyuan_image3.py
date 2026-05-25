@@ -56,11 +56,14 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
         kwargs = {
             "encoder_attention_mask": batch.encoder_attention_mask,
             "image_mask": batch.image_mask,
+            "image_scatter_index": batch.image_scatter_index,
             "timestep_scatter_index": batch.gen_timestep_scatter_index
             if batch.gen_timestep_scatter_index is not None
             else batch.timestep_scatter_index,
             "cond_vae_image_mask": batch.cond_vae_image_mask,
+            "cond_vae_scatter_index": batch.cond_vae_scatter_index,
             "cond_vit_image_mask": batch.cond_vit_image_mask,
+            "cond_vit_scatter_index": batch.cond_vit_scatter_index,
             "cond_vit_embeds": batch.cond_vit_embeds,
             "rope_2d": batch.rope_2d,
             "position_ids": batch.position_ids,
@@ -83,13 +86,18 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
         # 注意：encoder_hidden_states 由 get_neg_prompt_embeds() 处理
         return {
             "encoder_attention_mask": batch.neg_encoder_attention_mask,
-            "image_mask": batch.image_mask,
-            "timestep_scatter_index": batch.timestep_scatter_index,
+            "image_mask": batch.neg_image_mask,
+            "image_scatter_index": batch.neg_image_scatter_index,
+            "timestep_scatter_index": batch.neg_gen_timestep_scatter_index
+            if batch.neg_gen_timestep_scatter_index is not None
+            else batch.neg_timestep_scatter_index,
             "cond_vae_image_mask": None,
+            "cond_vae_scatter_index": None,
             "cond_vit_image_mask": None,
+            "cond_vit_scatter_index": None,
             "cond_vit_embeds": None,
-            "rope_2d": batch.rope_2d,
-            "position_ids": batch.position_ids,
+            "rope_2d": batch.neg_rope_2d,
+            "position_ids": batch.neg_position_ids,
             "token_h": batch.token_h,
             "token_w": batch.token_w,
         }

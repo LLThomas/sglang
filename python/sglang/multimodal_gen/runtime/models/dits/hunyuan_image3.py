@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
+from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DiTConfig,
@@ -85,6 +86,29 @@ def real_batched_index_select(t, dim, idx):
     return torch.stack(
         [torch.index_select(t[i], dim - 1, idx[i]) for i in range(len(t))]
     )
+
+
+def _indices_from_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Build per-batch token indices without using masked_select on Ascend."""
+    mask = mask.bool()
+    coords = torch.nonzero(mask, as_tuple=False)
+    if coords.numel() == 0:
+        return torch.empty(mask.shape[0], 0, device=mask.device, dtype=torch.long)
+    return coords[:, 1].reshape(mask.shape[0], -1)
+
+
+def _gather_tokens_by_index(hidden_states: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    index = index.to(device=hidden_states.device, dtype=torch.long)
+    index = index.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1])
+    return hidden_states.gather(dim=1, index=index)
+
+
+def _scatter_tokens_by_index(
+    hidden_states: torch.Tensor, index: torch.Tensor, src: torch.Tensor
+) -> torch.Tensor:
+    index = index.to(device=hidden_states.device, dtype=torch.long)
+    index = index.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1])
+    return hidden_states.scatter(dim=1, index=index, src=src)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +213,8 @@ def build_2d_rope(
 
     cos = torch.cos(idx_theta)
     sin = torch.sin(idx_theta)
+    cos = torch.cat((cos, cos), dim=-1)
+    sin = torch.cat((sin, sin), dim=-1)
 
     if return_all_pos:
         return cos, sin, all_pos
@@ -769,19 +795,27 @@ class HunYuanAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        num_kv_groups = self.num_heads // self.num_kv_heads
+        qkv = qkv.reshape(
+            bsz,
+            q_len,
+            self.num_kv_heads,
+            num_kv_groups + 2,
+            self.head_dim,
+        )
+        q, k, v = torch.split(qkv, [num_kv_groups, 1, 1], dim=3)
 
-        # Reshape: [B, L, D] -> [B, L, H, D_h] -> [B, H, L, D_h]
-        q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Official checkpoints pack each KV group as [q..., k, v].
+        q = q.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # Apply 2D RoPE if provided
         if rope_2d is not None:
             cos, sin = rope_2d
             # cos/sin: [B, L, D_h] -> [B, 1, L, D_h]
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
+            cos = cos.unsqueeze(1).to(device=q.device, dtype=q.dtype)
+            sin = sin.unsqueeze(1).to(device=q.device, dtype=q.dtype)
             q = (q * cos) + (rotate_half(q) * sin)
             k = (k * cos) + (rotate_half(k) * sin)
 
@@ -794,6 +828,9 @@ class HunYuanAttention(nn.Module):
             n_rep = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
+
+        if attention_mask is not None and attention_mask.dtype is not torch.bool:
+            attention_mask = attention_mask.to(device=q.device, dtype=q.dtype)
 
         # SDPA attention
         attn_output = F.scaled_dot_product_attention(
@@ -830,9 +867,8 @@ class HunYuanMLP(nn.Module):
 
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
-        # SiLU-gated: gate * up
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = F.silu(gate) * up
+        up, gate = gate_up.chunk(2, dim=-1)
+        x = up * F.silu(gate)
         x = self.down_proj(x)
         return x
 
@@ -873,20 +909,25 @@ class HunYuanSparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)  # [N, num_experts]
         scores = F.softmax(router_logits, dim=-1)
 
-        # Top-k selection
         top_k_scores, top_k_indices = scores.topk(self.top_k, dim=-1)
         if self.top_k > 1:
-            top_k_scores = top_k_scores / top_k_scores.sum(dim=-1, keepdim=True)
+            top_k_scores = top_k_scores / torch.clamp(
+                top_k_scores.sum(dim=-1, keepdim=True),
+                min=torch.finfo(top_k_scores.dtype).eps,
+            )
 
-        # Dispatch and combine
-        output = torch.zeros_like(hidden_states)
-        for k_idx in range(self.top_k):
-            for expert_idx in range(self.num_experts):
-                mask = top_k_indices[:, k_idx] == expert_idx
-                if mask.any():
-                    expert_input = hidden_states[mask]
-                    expert_output = self.experts[expert_idx](expert_input)
-                    output[mask] += top_k_scores[mask, k_idx].unsqueeze(-1) * expert_output
+        flat_top_k_indices = top_k_indices.reshape(-1)
+        repeated_hidden_states = hidden_states.repeat_interleave(self.top_k, dim=0)
+        expert_outputs = torch.zeros_like(repeated_hidden_states)
+
+        for expert_idx, expert in enumerate(self.experts):
+            expert_mask = flat_top_k_indices == expert_idx
+            expert_outputs[expert_mask] = expert(repeated_hidden_states[expert_mask])
+
+        output = (
+            expert_outputs.view(hidden_states.shape[0], self.top_k, hidden_dim)
+            * top_k_scores.to(expert_outputs.dtype).unsqueeze(-1)
+        ).sum(dim=1)
 
         if self.shared_mlp is not None:
             output = output + self.shared_mlp(hidden_states)
@@ -1108,9 +1149,12 @@ class HunyuanImage3DiT(CachableDiT):
         encoder_hidden_states: torch.Tensor,
         encoder_attention_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        image_scatter_index: torch.Tensor | None = None,
         timestep_scatter_index: torch.Tensor | None = None,
         cond_vae_image_mask: torch.Tensor | None = None,
+        cond_vae_scatter_index: torch.Tensor | None = None,
         cond_vit_image_mask: torch.Tensor | None = None,
+        cond_vit_scatter_index: torch.Tensor | None = None,
         cond_vit_embeds: torch.Tensor | None = None,
         rope_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
         position_ids: torch.Tensor | None = None,
@@ -1127,9 +1171,12 @@ class HunyuanImage3DiT(CachableDiT):
             encoder_hidden_states: Full token sequence embeddings [B, seq_len, dim].
             encoder_attention_mask: Attention mask [B, seq_len] or [B, 1, seq_len, seq_len].
             image_mask: Boolean mask [B, seq_len] indicating image token positions.
+            image_scatter_index: Precomputed image token positions [B, num_patches].
             timestep_scatter_index: Index tensor for scattering timestep embeddings.
             cond_vae_image_mask: Mask for conditional VAE image positions (I2I).
+            cond_vae_scatter_index: Conditional VAE image token positions.
             cond_vit_image_mask: Mask for conditional ViT image positions (I2I).
+            cond_vit_scatter_index: Conditional ViT image token positions.
             cond_vit_embeds: ViT condition embeddings for I2I.
             rope_2d: Tuple of (cos, sin) for 2D rotary position embeddings.
             position_ids: Position IDs for the token sequence.
@@ -1149,19 +1196,11 @@ class HunyuanImage3DiT(CachableDiT):
         patch_output, token_h, token_w = self.patch_embed(hidden_states, t_emb)
 
         # 3. Scatter patch embeddings into image token positions
-        if image_mask is not None:
-            n_embd = inputs_embeds.shape[-1]
-            image_scatter_index = (
-                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-                .unsqueeze(0)
-                .expand(bsz, -1)
-                .masked_select(image_mask.bool())
-                .reshape(bsz, -1)
-            )
-            inputs_embeds = inputs_embeds.scatter(
-                dim=1,
-                index=image_scatter_index.unsqueeze(-1).expand(-1, -1, n_embd),
-                src=patch_output,
+        if image_scatter_index is None and image_mask is not None:
+            image_scatter_index = _indices_from_mask(image_mask)
+        if image_scatter_index is not None:
+            inputs_embeds = _scatter_tokens_by_index(
+                inputs_embeds, image_scatter_index, patch_output
             )
 
         # 4. Scatter timestep embedding into timestep token positions
@@ -1180,21 +1219,14 @@ class HunyuanImage3DiT(CachableDiT):
             cond_timestep = kwargs.get("cond_timestep", timestep)
             cond_t_emb = self.time_embed(cond_timestep)
             cond_patch_output, _, _ = self.patch_embed(cond_vae_images, cond_t_emb)
-            n_embd = inputs_embeds.shape[-1]
-            cond_scatter_index = (
-                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-                .unsqueeze(0)
-                .expand(bsz, -1)
-                .masked_select(cond_vae_image_mask.bool())
-                .reshape(bsz, -1)
-            )
-            inputs_embeds = inputs_embeds.scatter(
-                dim=1,
-                index=cond_scatter_index.unsqueeze(-1).expand(-1, -1, n_embd),
-                src=cond_patch_output,
+            if cond_vae_scatter_index is None:
+                cond_vae_scatter_index = _indices_from_mask(cond_vae_image_mask)
+            inputs_embeds = _scatter_tokens_by_index(
+                inputs_embeds, cond_vae_scatter_index, cond_patch_output
             )
             if kwargs.get("cond_timestep_scatter_index") is not None:
                 cond_ts_index = kwargs["cond_timestep_scatter_index"]
+                n_embd = inputs_embeds.shape[-1]
                 cond_ts_emb = self.timestep_emb(cond_timestep).reshape(bsz, 1, n_embd)
                 inputs_embeds = inputs_embeds.scatter(
                     dim=1,
@@ -1204,7 +1236,20 @@ class HunyuanImage3DiT(CachableDiT):
 
         # 6. (I2I) Add condition ViT embeddings
         if cond_vit_image_mask is not None and cond_vit_embeds is not None:
-            inputs_embeds[cond_vit_image_mask.bool()] += cond_vit_embeds
+            if cond_vit_scatter_index is None:
+                cond_vit_scatter_index = _indices_from_mask(cond_vit_image_mask)
+            cond_vit_embeds = cond_vit_embeds.reshape(
+                bsz, -1, inputs_embeds.shape[-1]
+            ).to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+            inputs_embeds = inputs_embeds.scatter_add(
+                dim=1,
+                index=cond_vit_scatter_index.to(
+                    device=inputs_embeds.device, dtype=torch.long
+                )
+                .unsqueeze(-1)
+                .expand(-1, -1, inputs_embeds.shape[-1]),
+                src=cond_vit_embeds,
+            )
 
         # 7. Apply 2D RoPE
         hidden = inputs_embeds
@@ -1221,11 +1266,8 @@ class HunyuanImage3DiT(CachableDiT):
         hidden = self.norm(hidden)
 
         # 10. Extract image token outputs
-        if image_mask is not None:
-            n_embd = hidden.shape[-1]
-            image_output = hidden.masked_select(image_mask.unsqueeze(-1).bool()).reshape(
-                bsz, -1, n_embd
-            )
+        if image_scatter_index is not None:
+            image_output = _gather_tokens_by_index(hidden, image_scatter_index)
         else:
             image_output = hidden
 
@@ -1275,88 +1317,95 @@ class HunyuanImage3DiT(CachableDiT):
         """
         device = input_ids.device
         generated = input_ids.clone()
+        is_fsdp_root = isinstance(self, FSDPModule)
+        if is_fsdp_root:
+            self.unshard()
 
-        for _ in range(max_new_tokens):
-            seq_len = generated.shape[1]
+        try:
+            for _ in range(max_new_tokens):
+                seq_len = generated.shape[1]
 
-            # 1. Embed tokens
-            hidden_states = self.embed_tokens(generated)
+                # 1. Embed tokens
+                hidden_states = self.embed_tokens(generated)
 
-            # 2. Build attention mask for current sequence length
-            if seq_len > attention_mask.shape[-1]:
-                causal_mask = torch.triu(
-                    torch.full((seq_len, seq_len), float("-inf"), device=device),
-                    diagonal=1,
-                ).unsqueeze(0).unsqueeze(0)
-            else:
-                causal_mask = attention_mask[:, :, :seq_len, :seq_len]
+                # 2. Build attention mask for current sequence length
+                if seq_len > attention_mask.shape[-1]:
+                    causal_mask = torch.triu(
+                        torch.full((seq_len, seq_len), float("-inf"), device=device),
+                        diagonal=1,
+                    ).unsqueeze(0).unsqueeze(0)
+                else:
+                    causal_mask = attention_mask[:, :, :seq_len, :seq_len]
 
-            # 3. Build RoPE for current sequence length
-            if rope_2d is not None and seq_len > rope_2d[0].shape[1]:
-                n_elem = rope_2d[0].shape[-1]
-                new_cos, new_sin = build_batch_2d_rope(
-                    seq_len=seq_len,
-                    n_elem=n_elem,
-                    image_infos=None,
-                    device=device,
-                    base=self.rope_theta,
-                )
-                cur_rope_2d = (new_cos, new_sin)
-            elif rope_2d is not None:
-                cur_rope_2d = (
-                    rope_2d[0][:, :seq_len],
-                    rope_2d[1][:, :seq_len],
-                )
-            else:
-                cur_rope_2d = None
-
-            # 4. Pass through transformer layers
-            for layer in self.layers:
-                hidden_states = layer(
-                    hidden_states=hidden_states,
-                    rope_2d=cur_rope_2d,
-                    attention_mask=causal_mask,
-                )
-
-            # 5. Norm + lm_head to get logits
-            hidden_states = self.norm(hidden_states)
-            logits = self.lm_head(hidden_states[:, -1, :])  # [1, vocab_size]
-
-            # 6. Apply logits processor
-            if logits_processor is not None:
-                logits = logits_processor(logits, generated)
-
-            # 7. Sample next token
-            if top_k == 1:
-                next_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
-            else:
-                logits = logits / max(temperature, 1e-8)
-                if top_k > 1:
-                    top_k_val = min(top_k, logits.size(-1))
-                    topk_vals, _ = torch.topk(logits, top_k_val)
-                    logits[logits < topk_vals[:, -1:]] = float("-inf")
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(
-                        torch.softmax(sorted_logits, dim=-1), dim=-1
+                # 3. Build RoPE for current sequence length
+                if rope_2d is not None and seq_len > rope_2d[0].shape[1]:
+                    n_elem = rope_2d[0].shape[-1]
+                    new_cos, new_sin = build_batch_2d_rope(
+                        seq_len=seq_len,
+                        n_elem=n_elem,
+                        image_infos=None,
+                        device=device,
+                        base=self.rope_theta,
                     )
-                    sorted_mask = cumulative_probs - torch.softmax(
-                        sorted_logits, dim=-1
-                    ) >= top_p
-                    sorted_logits[sorted_mask] = float("-inf")
-                    logits = sorted_logits.scatter(
-                        1, sorted_indices, sorted_logits
+                    cur_rope_2d = (new_cos, new_sin)
+                elif rope_2d is not None:
+                    cur_rope_2d = (
+                        rope_2d[0][:, :seq_len],
+                        rope_2d[1][:, :seq_len],
                     )
-                probs = torch.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    cur_rope_2d = None
 
-            generated = torch.cat([generated, next_token], dim=1)
+                # 4. Pass through transformer layers
+                for layer in self.layers:
+                    hidden_states = layer(
+                        hidden_states=hidden_states,
+                        rope_2d=cur_rope_2d,
+                        attention_mask=causal_mask,
+                    )
 
-            # 8. Check stopping conditions
-            if eos_token_id is not None and next_token.item() == eos_token_id:
-                break
-            if stop_token_ids is not None and next_token.item() in stop_token_ids:
-                break
+                # 5. Norm + lm_head to get logits
+                hidden_states = self.norm(hidden_states)
+                logits = self.lm_head(hidden_states[:, -1, :])  # [1, vocab_size]
+
+                # 6. Apply logits processor
+                if logits_processor is not None:
+                    logits = logits_processor(logits, generated)
+
+                # 7. Sample next token
+                if top_k == 1:
+                    next_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
+                else:
+                    logits = logits / max(temperature, 1e-8)
+                    if top_k > 1:
+                        top_k_val = min(top_k, logits.size(-1))
+                        topk_vals, _ = torch.topk(logits, top_k_val)
+                        logits[logits < topk_vals[:, -1:]] = float("-inf")
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                        cumulative_probs = torch.cumsum(
+                            torch.softmax(sorted_logits, dim=-1), dim=-1
+                        )
+                        sorted_mask = cumulative_probs - torch.softmax(
+                            sorted_logits, dim=-1
+                        ) >= top_p
+                        sorted_logits[sorted_mask] = float("-inf")
+                        logits = sorted_logits.scatter(
+                            1, sorted_indices, sorted_logits
+                        )
+                    probs = torch.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+
+                generated = torch.cat([generated, next_token], dim=1)
+
+                # 8. Check stopping conditions
+                if eos_token_id is not None and next_token.item() == eos_token_id:
+                    break
+                if stop_token_ids is not None and next_token.item() in stop_token_ids:
+                    break
+        finally:
+            if is_fsdp_root:
+                self.reshard()
 
         return generated
 

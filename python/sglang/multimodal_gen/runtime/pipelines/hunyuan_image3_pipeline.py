@@ -11,29 +11,160 @@ handle the custom layout, similar to ``Hunyuan3D2Pipeline``.
 
 import glob
 import os
+from itertools import chain
 from typing import Any
 
 import torch
-from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
-    FlowMatchEulerDiscreteScheduler,
-)
+from torch.distributed import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    load_model_from_full_model_state_dict,
+    shard_model,
+)
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
+    set_default_torch_dtype,
+)
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    safetensors_weights_iterator,
+)
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_hunyuanimage3 import (
     AutoencoderKLConv3D,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3 import (
     HunyuanImage3BeforeDenoisingStage,
+    HunyuanImage3DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
+
+
+def _apply_hunyuan_image3_npu_overrides(server_args: ServerArgs) -> None:
+    if (
+        current_platform.is_npu()
+        and server_args.use_fsdp_inference
+        and server_args.dit_cpu_offload
+        and server_args.pin_cpu_memory
+    ):
+        logger.warning(
+            "Disabling pin_cpu_memory for HunyuanImage3 DiT FSDP CPU offload on NPU. "
+            "Pinned H2D parameter copies can trigger Ascend vector core exceptions "
+            "during repeated denoising unshards."
+        )
+        server_args.pin_cpu_memory = False
+
+
+def _hunyuan_image3_transformer_weight_iterator(
+    safetensors_list,
+    model,
+    param_names_mapping,
+):
+    """Yield only flat-checkpoint weights that belong to the DiT transformer."""
+    valid_target_names = set(model.state_dict().keys())
+    skipped = 0
+
+    for name, tensor in safetensors_weights_iterator(safetensors_list):
+        target_name, _, _ = param_names_mapping(name)
+        if target_name in valid_target_names:
+            yield name, tensor
+        else:
+            skipped += 1
+
+    if skipped:
+        logger.info(
+            "Skipped %d non-transformer tensor(s) while loading HunyuanImage3 DiT",
+            skipped,
+        )
+
+
+def _load_hunyuan_image3_transformer(
+    *,
+    model_cls,
+    init_params: dict[str, Any],
+    safetensors_list: list[str],
+    device: torch.device,
+    server_args: ServerArgs,
+) -> torch.nn.Module:
+    """Load HunyuanImage3 DiT from a flat repo checkpoint.
+
+    The repo-root safetensors include transformer, VAE, and optional vision
+    tensors. Filtering here keeps the generic FSDP loader strict while allowing
+    this model-specific flat layout.
+    """
+    param_dtype = torch.bfloat16
+    reduce_dtype = torch.float32
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype,
+        reduce_dtype,
+        None,
+        cast_forward_inputs=False,
+    )
+    set_mixed_precision_policy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=None,
+        mp_policy=mp_policy,
+    )
+
+    with set_default_torch_dtype(param_dtype), torch.device("meta"):
+        model = model_cls(**init_params)
+
+    if server_args.use_fsdp_inference and not current_platform.is_mps():
+        model._pre_fsdp_weight_loader_params = {
+            n: p
+            for n, p in model.named_parameters()
+            if getattr(p, "weight_loader", None)
+        }
+        device_mesh = init_device_mesh(
+            current_platform.device_type,
+            mesh_shape=(server_args.hsdp_replicate_dim, server_args.hsdp_shard_dim),
+            mesh_dim_names=("replicate", "shard"),
+        )
+        shard_model(
+            model,
+            cpu_offload=server_args.dit_cpu_offload,
+            reshard_after_forward=True,
+            mp_policy=mp_policy,
+            mesh=device_mesh,
+            fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
+            pin_cpu_memory=server_args.pin_cpu_memory,
+        )
+
+    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+    weight_iterator = _hunyuan_image3_transformer_weight_iterator(
+        safetensors_list,
+        model,
+        param_names_mapping_fn,
+    )
+    load_model_from_full_model_state_dict(
+        model,
+        weight_iterator,
+        device,
+        param_dtype,
+        strict=False,
+        cpu_offload=server_args.dit_cpu_offload,
+        param_names_mapping=param_names_mapping_fn,
+    )
+
+    model.post_load_weights()
+
+    for name, param in chain(model.named_parameters(), model.named_buffers()):
+        if param.is_meta:
+            raise RuntimeError(f"Unexpected param or buffer {name} on meta device.")
+    return model
 
 
 class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
@@ -88,6 +219,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
 
         model_path = server_args.model_path
         device = get_local_torch_device()
+        _apply_hunyuan_image3_npu_overrides(server_args)
 
         # Download the full model if not already local
         if not os.path.isdir(model_path) or not os.path.isfile(
@@ -114,11 +246,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             components["transformer"] = loaded_modules["transformer"]
         else:
             from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
-                TransformerLoader,
                 resolve_transformer_safetensors_to_load,
-            )
-            from sglang.multimodal_gen.runtime.loader.fsdp_load import (
-                maybe_load_fsdp_model,
             )
             from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
             from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -143,20 +271,12 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 server_args, local_model_path
             )
 
-            model = maybe_load_fsdp_model(
+            model = _load_hunyuan_image3_transformer(
                 model_cls=model_cls,
                 init_params={"config": dit_config, "hf_config": config},
-                weight_dir_list=safetensors_list,
+                safetensors_list=safetensors_list,
                 device=device,
-                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
-                hsdp_shard_dim=server_args.hsdp_shard_dim,
-                param_dtype=torch.bfloat16,
-                reduce_dtype=torch.float32,
-                output_dtype=None,
-                cpu_offload=server_args.dit_cpu_offload,
-                pin_cpu_memory=server_args.pin_cpu_memory,
-                fsdp_inference=server_args.use_fsdp_inference,
-                strict=False,
+                server_args=server_args,
             )
             components["transformer"] = model
             server_args.model_loaded["transformer"] = True
@@ -325,7 +445,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         self.add_stage(
-            DenoisingStage(
+            HunyuanImage3DenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),
@@ -334,4 +454,4 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_decoding_stage()
 
 
-EntryClass = [HunyuanImage3Pipeline]
+EntryClass = [HunyuanImage3Pipeline]
