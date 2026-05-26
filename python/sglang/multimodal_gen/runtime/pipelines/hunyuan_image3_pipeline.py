@@ -55,14 +55,19 @@ logger = init_logger(__name__)
 def _apply_hunyuan_image3_npu_overrides(server_args: ServerArgs) -> None:
     if (
         current_platform.is_npu()
-        and server_args.use_fsdp_inference
-        and server_args.dit_cpu_offload
+        and (
+            (
+                server_args.use_fsdp_inference
+                and server_args.dit_cpu_offload
+            )
+            or server_args.is_dit_layerwise_offload_selected
+        )
         and server_args.pin_cpu_memory
     ):
         logger.warning(
-            "Disabling pin_cpu_memory for HunyuanImage3 DiT FSDP CPU offload on NPU. "
+            "Disabling pin_cpu_memory for HunyuanImage3 DiT offload on NPU. "
             "Pinned H2D parameter copies can trigger Ascend vector core exceptions "
-            "during repeated denoising unshards."
+            "during repeated layer transfers."
         )
         server_args.pin_cpu_memory = False
 
@@ -149,13 +154,22 @@ def _load_hunyuan_image3_transformer(
         model,
         param_names_mapping_fn,
     )
+    layerwise_cpu_materialize = (
+        server_args.is_dit_layerwise_offload_selected
+        and not server_args.use_fsdp_inference
+    )
+    if layerwise_cpu_materialize:
+        logger.info(
+            "Loading HunyuanImage3 DiT weights on CPU for layerwise offload "
+            "initialization."
+        )
     load_model_from_full_model_state_dict(
         model,
         weight_iterator,
         device,
         param_dtype,
         strict=False,
-        cpu_offload=server_args.dit_cpu_offload,
+        cpu_offload=server_args.dit_cpu_offload or layerwise_cpu_materialize,
         param_names_mapping=param_names_mapping_fn,
     )
 

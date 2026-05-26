@@ -10,6 +10,7 @@
 
 import logging
 import math
+import time
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,9 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DiTConfig,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 
 logger = logging.getLogger(__name__)
@@ -272,30 +276,148 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-class HunyuanImage3ARCache:
-    """Small dynamic KV cache for HunyuanImage3 text generation."""
+class HunyuanImage3LayerKVCache:
+    """Layer-local KV cache for HunyuanImage3 AR text generation."""
 
-    def __init__(self, num_layers: int):
-        self.keys: list[torch.Tensor | None] = [None] * num_layers
-        self.values: list[torch.Tensor | None] = [None] * num_layers
+    def __init__(self, max_cache_len: int | None = None):
+        self.k_cache: torch.Tensor | None = None
+        self.v_cache: torch.Tensor | None = None
+        self.max_cache_len = max_cache_len
+        self.cache_len = 0
 
-    def update(
+    def _target_len(
+        self,
+        key_states: torch.Tensor,
+        cache_position: torch.Tensor | None,
+        cache_end: int | None,
+    ) -> int:
+        if cache_end is not None:
+            needed_len = cache_end
+        elif cache_position is None:
+            needed_len = self.cache_len + key_states.shape[2]
+        else:
+            needed_len = int(cache_position.max().item()) + 1
+        if self.max_cache_len is not None:
+            return max(self.max_cache_len, needed_len)
+        return needed_len
+
+    def _ensure_cache(
         self,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
-        layer_idx: int,
+        cache_position: torch.Tensor | None,
+        cache_end: int | None,
+    ) -> None:
+        target_len = self._target_len(key_states, cache_position, cache_end)
+        if self.k_cache is not None and self.k_cache.shape[2] >= target_len:
+            return
+
+        k_cache = key_states.new_empty(
+            key_states.shape[0],
+            key_states.shape[1],
+            target_len,
+            key_states.shape[3],
+        )
+        v_cache = value_states.new_empty(
+            value_states.shape[0],
+            value_states.shape[1],
+            target_len,
+            value_states.shape[3],
+        )
+        if self.k_cache is not None and self.cache_len > 0:
+            k_cache[:, :, : self.cache_len].copy_(
+                self.k_cache[:, :, : self.cache_len]
+            )
+            v_cache[:, :, : self.cache_len].copy_(
+                self.v_cache[:, :, : self.cache_len]
+            )
+        self.k_cache = k_cache
+        self.v_cache = v_cache
+
+    def store(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        cache_position: torch.Tensor | None = None,
+        cache_end: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.keys[layer_idx] is None:
-            self.keys[layer_idx] = key_states
-            self.values[layer_idx] = value_states
+        if cache_position is not None:
+            cache_position = cache_position.to(
+                device=key_states.device, dtype=torch.long
+            )
+
+        self._ensure_cache(key_states, value_states, cache_position, cache_end)
+        assert self.k_cache is not None and self.v_cache is not None
+
+        if cache_position is None:
+            start = self.cache_len
+            end = start + key_states.shape[2]
+            self.k_cache[:, :, start:end].copy_(key_states)
+            self.v_cache[:, :, start:end].copy_(value_states)
+        elif cache_position.dim() == 1:
+            self.k_cache.index_copy_(2, cache_position, key_states)
+            self.v_cache.index_copy_(2, cache_position, value_states)
+            end = (
+                cache_end
+                if cache_end is not None
+                else int(cache_position[-1].item()) + 1
+            )
+        elif cache_position.dim() == 2:
+            if cache_position.shape[0] != self.k_cache.shape[0]:
+                raise ValueError(
+                    "cache_position batch size must match cache batch size, got "
+                    f"{cache_position.shape[0]} and {self.k_cache.shape[0]}"
+                )
+            for batch_idx in range(cache_position.shape[0]):
+                self.k_cache[batch_idx].index_copy_(
+                    1, cache_position[batch_idx], key_states[batch_idx]
+                )
+                self.v_cache[batch_idx].index_copy_(
+                    1, cache_position[batch_idx], value_states[batch_idx]
+                )
+            end = (
+                cache_end
+                if cache_end is not None
+                else int(cache_position.max().item()) + 1
+            )
         else:
-            self.keys[layer_idx] = torch.cat(
-                [self.keys[layer_idx], key_states], dim=2
+            raise ValueError(
+                "cache_position must be 1D or 2D, got "
+                f"{tuple(cache_position.shape)}"
             )
-            self.values[layer_idx] = torch.cat(
-                [self.values[layer_idx], value_states], dim=2
-            )
-        return self.keys[layer_idx], self.values[layer_idx]
+
+        self.cache_len = max(self.cache_len, end)
+        return self.get()
+
+    def get(self) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.k_cache is not None and self.v_cache is not None
+        return (
+            self.k_cache[:, :, : self.cache_len],
+            self.v_cache[:, :, : self.cache_len],
+        )
+
+    def clear(self) -> None:
+        self.k_cache = None
+        self.v_cache = None
+        self.cache_len = 0
+
+
+class HunyuanImage3ARCache:
+    """Container for per-layer HunyuanImage3 AR KV caches."""
+
+    def __init__(self, num_layers: int, max_cache_len: int | None = None):
+        self.num_layers = num_layers
+        self.caches = [
+            HunyuanImage3LayerKVCache(max_cache_len=max_cache_len)
+            for _ in range(num_layers)
+        ]
+
+    def __getitem__(self, layer_idx: int) -> HunyuanImage3LayerKVCache:
+        return self.caches[layer_idx]
+
+    def clear(self) -> None:
+        for cache in self.caches:
+            cache.clear()
 
 
 def apply_rotary_pos_emb(
@@ -818,7 +940,9 @@ class HunYuanAttention(nn.Module):
         hidden_states: torch.Tensor,
         rope_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
-        past_key_value: HunyuanImage3ARCache | None = None,
+        kv_cache: HunyuanImage3LayerKVCache | None = None,
+        cache_position: torch.Tensor | None = None,
+        cache_end: int | None = None,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -851,8 +975,8 @@ class HunYuanAttention(nn.Module):
             q = self.query_layernorm(q)
             k = self.key_layernorm(k)
 
-        if past_key_value is not None:
-            k, v = past_key_value.update(k, v, self.layer_idx)
+        if kv_cache is not None:
+            k, v = kv_cache.store(k, v, cache_position, cache_end)
             q = q.to(k.dtype)
 
         # GQA: repeat kv heads
@@ -1028,7 +1152,9 @@ class HunyuanImage3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         rope_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
-        past_key_value: HunyuanImage3ARCache | None = None,
+        kv_cache: HunyuanImage3LayerKVCache | None = None,
+        cache_position: torch.Tensor | None = None,
+        cache_end: int | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1037,7 +1163,9 @@ class HunyuanImage3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             rope_2d=rope_2d,
             attention_mask=attention_mask,
-            past_key_value=past_key_value,
+            kv_cache=kv_cache,
+            cache_position=cache_position,
+            cache_end=cache_end,
         )
         hidden_states = residual + hidden_states
 
@@ -1054,7 +1182,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class HunyuanImage3DiT(CachableDiT):
+class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     HunyuanImage-3.0 Diffusion Transformer backbone.
 
@@ -1137,6 +1265,7 @@ class HunyuanImage3DiT(CachableDiT):
                 for i in range(arch.num_hidden_layers)
             ]
         )
+        self.layer_names = ["layers"]
 
         # Final norm
         self.norm = RMSNorm(arch.hidden_size, eps=getattr(arch, "rms_norm_eps", 1e-5))
@@ -1182,7 +1311,9 @@ class HunyuanImage3DiT(CachableDiT):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         rope_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
-        past_key_values: HunyuanImage3ARCache | None = None,
+        kv_caches: HunyuanImage3ARCache | None = None,
+        cache_position: torch.Tensor | None = None,
+        cache_end: int | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, HunyuanImage3ARCache]:
         """Forward text tokens through the root module for AR logits.
@@ -1192,18 +1323,20 @@ class HunyuanImage3DiT(CachableDiT):
         initializing child layer FSDP states before the root state.
         """
         hidden_states = self.embed_tokens(input_ids)
-        cache = past_key_values if use_cache else None
-        for layer in self.layers:
+        caches = kv_caches if use_cache else None
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states=hidden_states,
                 rope_2d=rope_2d,
                 attention_mask=attention_mask,
-                past_key_value=cache,
+                kv_cache=caches[layer_idx] if caches is not None else None,
+                cache_position=cache_position,
+                cache_end=cache_end,
             )
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states[:, -1, :])
         if use_cache:
-            return logits, cache
+            return logits, caches
         return logits
 
     def forward(
@@ -1259,7 +1392,9 @@ class HunyuanImage3DiT(CachableDiT):
                 input_ids=input_ids,
                 attention_mask=encoder_attention_mask,
                 rope_2d=rope_2d,
-                past_key_values=kwargs.get("past_key_values"),
+                kv_caches=kwargs.get("kv_caches"),
+                cache_position=kwargs.get("cache_position"),
+                cache_end=kwargs.get("cache_end"),
                 use_cache=kwargs.get("use_cache", False),
             )
 
@@ -1374,6 +1509,7 @@ class HunyuanImage3DiT(CachableDiT):
         eos_token_id: int | None = None,
         stop_token_ids: list[int] | None = None,
         logits_processor=None,
+        progress_log_interval: int = 16,
     ) -> torch.Tensor:
         """Autoregressive text generation using the transformer + lm_head.
 
@@ -1394,17 +1530,43 @@ class HunyuanImage3DiT(CachableDiT):
             eos_token_id: End-of-sequence token ID.
             stop_token_ids: Token IDs that stop generation.
             logits_processor: Optional callable(logits, input_ids) -> logits.
+            progress_log_interval: Emit progress logs every N generated tokens.
+                Set to 0 to disable progress logs.
 
         Returns:
             Generated token IDs [1, seq_len + num_generated].
         """
         device = input_ids.device
+        start_time = time.perf_counter()
+        input_seq_len = input_ids.shape[1]
         generated = input_ids.clone()
         if max_new_tokens <= 0:
             return generated
 
-        cache = HunyuanImage3ARCache(len(self.layers))
         total_seq_len = generated.shape[1] + max_new_tokens
+        progress_log_interval = max(0, int(progress_log_interval or 0))
+        stop_token_id_set = set(stop_token_ids or [])
+        logger.info(
+            "AR text generation started: prompt_tokens=%d, max_new_tokens=%d, "
+            "cache_max_len=%d, stop_tokens=%d, top_k=%d, top_p=%.3f, "
+            "temperature=%.3f, progress_interval=%d",
+            input_seq_len,
+            max_new_tokens,
+            total_seq_len,
+            len(stop_token_id_set),
+            top_k,
+            top_p,
+            temperature,
+            progress_log_interval,
+        )
+        kv_caches = HunyuanImage3ARCache(
+            len(self.layers), max_cache_len=total_seq_len
+        )
+        initial_position_ids = None
+        if position_ids is not None:
+            initial_position_ids = position_ids.to(device=device, dtype=torch.long)
+            if initial_position_ids.dim() == 2:
+                initial_position_ids = initial_position_ids[0]
         if rope_2d is not None and total_seq_len > rope_2d[0].shape[1]:
             n_elem = rope_2d[0].shape[-1]
             rope_2d = build_batch_2d_rope(
@@ -1419,6 +1581,16 @@ class HunyuanImage3DiT(CachableDiT):
             if step == 0:
                 seq_len = generated.shape[1]
                 current_input_ids = generated
+                cache_end = seq_len
+                if (
+                    initial_position_ids is not None
+                    and initial_position_ids.numel() >= seq_len
+                ):
+                    cache_position = initial_position_ids[:seq_len]
+                else:
+                    cache_position = torch.arange(
+                        seq_len, device=device, dtype=torch.long
+                    )
                 if seq_len > attention_mask.shape[-1]:
                     causal_mask = torch.triu(
                         torch.full((seq_len, seq_len), float("-inf"), device=device),
@@ -1434,9 +1606,22 @@ class HunyuanImage3DiT(CachableDiT):
             else:
                 seq_pos = generated.shape[1] - 1
                 current_input_ids = generated[:, -1:]
+                cache_end = seq_pos + 1
+                if (
+                    initial_position_ids is not None
+                    and initial_position_ids.numel() > seq_pos
+                ):
+                    cache_position = initial_position_ids[seq_pos : seq_pos + 1]
+                else:
+                    cache_position = torch.tensor(
+                        [seq_pos], device=device, dtype=torch.long
+                    )
                 causal_mask = None
                 cur_rope_2d = (
-                    (rope_2d[0][:, seq_pos : seq_pos + 1], rope_2d[1][:, seq_pos : seq_pos + 1])
+                    (
+                        rope_2d[0][:, seq_pos : seq_pos + 1],
+                        rope_2d[1][:, seq_pos : seq_pos + 1],
+                    )
                     if rope_2d is not None
                     else None
                 )
@@ -1446,10 +1631,12 @@ class HunyuanImage3DiT(CachableDiT):
                 encoder_attention_mask=causal_mask,
                 rope_2d=cur_rope_2d,
                 mode="ar_text",
-                past_key_values=cache,
+                kv_caches=kv_caches,
+                cache_position=cache_position,
+                cache_end=cache_end,
                 use_cache=True,
             )
-            logits, cache = outputs
+            logits, kv_caches = outputs
 
             # 1. Apply logits processor
             if logits_processor is not None:
@@ -1479,14 +1666,53 @@ class HunyuanImage3DiT(CachableDiT):
                 probs = torch.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
 
+            next_token_id = int(next_token.item())
             generated = torch.cat([generated, next_token], dim=1)
 
             # 3. Check stopping conditions
-            if eos_token_id is not None and next_token.item() == eos_token_id:
-                break
-            if stop_token_ids is not None and next_token.item() in stop_token_ids:
+            stop_reason = None
+            if eos_token_id is not None and next_token_id == eos_token_id:
+                stop_reason = "eos"
+            elif next_token_id in stop_token_id_set:
+                stop_reason = "stop_token"
+
+            generated_tokens = step + 1
+            should_log_progress = (
+                progress_log_interval > 0
+                and (
+                    generated_tokens == 1
+                    or generated_tokens % progress_log_interval == 0
+                    or stop_reason is not None
+                )
+            )
+            if should_log_progress:
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    "AR text generation progress: generated_tokens=%d/%d, "
+                    "elapsed=%.2fs, tokens_per_s=%.3f, last_token=%d, "
+                    "stop_reason=%s",
+                    generated_tokens,
+                    max_new_tokens,
+                    elapsed,
+                    generated_tokens / elapsed if elapsed > 0 else 0.0,
+                    next_token_id,
+                    stop_reason or "none",
+                )
+
+            if stop_reason is not None:
                 break
 
+        elapsed = time.perf_counter() - start_time
+        generated_tokens = generated.shape[1] - input_seq_len
+        logger.info(
+            "AR text generation finished: prompt_tokens=%d, generated_tokens=%d, "
+            "cache_max_len=%d, elapsed=%.2fs, tokens_per_s=%.3f",
+            input_seq_len,
+            generated_tokens,
+            total_seq_len,
+            elapsed,
+            generated_tokens / elapsed if elapsed > 0 else 0.0,
+        )
         return generated
 
     def get_ratio_index_from_token(self, ratio_token_id: int) -> int:

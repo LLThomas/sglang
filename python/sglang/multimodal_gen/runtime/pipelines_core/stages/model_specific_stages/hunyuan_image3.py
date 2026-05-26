@@ -33,7 +33,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    PipelineStage,
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -49,6 +52,81 @@ logger = init_logger(__name__)
 
 class HunyuanImage3DenoisingStage(DenoisingStage):
     """Denoising stage with Ascend-safe validation for HunyuanImage3 timesteps."""
+
+    _BROADCAST_TENSOR_FIELDS = (
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "latents",
+        "timesteps",
+        "encoder_attention_mask",
+        "neg_encoder_attention_mask",
+        "image_mask",
+        "image_scatter_index",
+        "neg_image_mask",
+        "neg_image_scatter_index",
+        "timestep_scatter_index",
+        "neg_timestep_scatter_index",
+        "gen_timestep_scatter_index",
+        "neg_gen_timestep_scatter_index",
+        "cond_timestep_scatter_index",
+        "cond_vae_image_mask",
+        "cond_vae_scatter_index",
+        "cond_vit_image_mask",
+        "cond_vit_scatter_index",
+        "cond_vit_embeds",
+        "cond_vae_images",
+        "cond_timestep",
+        "rope_2d",
+        "neg_rope_2d",
+        "position_ids",
+        "neg_position_ids",
+    )
+
+    @staticmethod
+    def _to_local_device(value: Any, device: torch.device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, list):
+            return [
+                HunyuanImage3DenoisingStage._to_local_device(item, device)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                HunyuanImage3DenoisingStage._to_local_device(item, device)
+                for item in value
+            )
+        if isinstance(value, dict):
+            return {
+                key: HunyuanImage3DenoisingStage._to_local_device(item, device)
+                for key, item in value.items()
+            }
+        return value
+
+    def _ensure_broadcast_tensors_on_local_device(self, batch: Req) -> None:
+        device = get_local_torch_device()
+        for field in self._BROADCAST_TENSOR_FIELDS:
+            if hasattr(batch, field):
+                setattr(
+                    batch,
+                    field,
+                    self._to_local_device(getattr(batch, field), device),
+                )
+
+        scheduler = getattr(batch, "scheduler", None)
+        if scheduler is not None:
+            for attr in ("timesteps", "sigmas"):
+                value = getattr(scheduler, attr, None)
+                if isinstance(value, torch.Tensor):
+                    setattr(scheduler, attr, value.to(device))
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if (
+            server_args.enable_cfg_parallel
+            and not server_args.use_fsdp_inference
+        ):
+            self._ensure_broadcast_tensors_on_local_device(batch)
+        return super().forward(batch, server_args)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -1163,6 +1241,15 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             ],
         )
 
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        if (
+            self.server_args.enable_cfg_parallel
+            and not self.server_args.use_fsdp_inference
+        ):
+            return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
+        return StageParallelismType.REPLICATED
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
@@ -1377,18 +1464,33 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         )
 
         # 6. Run AR generation
+        max_new_tokens = getattr(batch, "ar_max_new_tokens", 2048)
+        progress_log_interval = getattr(batch, "ar_progress_log_interval", 16)
+        if (
+            server_args.is_dit_layerwise_offload_selected
+            and max_new_tokens > 128
+        ):
+            logger.warning(
+                "HunyuanImage3 AR generation is using layerwise DiT offload "
+                "with max_new_tokens=%d. This keeps memory low but can be slow "
+                "because every generated token executes all DiT layers with "
+                "CPU-to-device layer transfers.",
+                max_new_tokens,
+            )
+
         generated_ids = self.transformer.generate_text(
             input_ids=input_ids,
             attention_mask=causal_mask,
             rope_2d=rope_2d,
             position_ids=ar_input["position_ids"].to(device),
-            max_new_tokens=getattr(batch, "ar_max_new_tokens", 2048),
+            max_new_tokens=max_new_tokens,
             temperature=getattr(batch, "ar_temperature", 1.0),
             top_p=getattr(batch, "ar_top_p", 1.0),
             top_k=getattr(batch, "ar_top_k", 1),
             eos_token_id=self.tokenizer_wrapper.eos_token_id,
             stop_token_ids=self._cot_stop_token_ids(bot_task, need_ratio),
             logits_processor=logits_processor,
+            progress_log_interval=progress_log_interval,
         )
 
         # 7. Parse output: extract cot_text and ratio_index
@@ -1500,6 +1602,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             eos_token_id=tw.eos_token_id,
             stop_token_ids=ratio_token_ids if ratio_token_ids else None,
             logits_processor=logits_processor,
+            progress_log_interval=getattr(batch, "ar_progress_log_interval", 16),
         )
 
         # 8. Extract ratio_index from generated tokens
@@ -1881,7 +1984,15 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         drop_think = getattr(batch, "drop_think", False)
 
         # 1a. Apply drop_think: strip think portion from cot_text
+        original_cot_text = cot_text
         cot_text = self._apply_drop_think(cot_text, drop_think)
+        if (
+            drop_think
+            and system_prompt
+            and self.tokenizer_wrapper.think_token in original_cot_text
+            and self.tokenizer_wrapper.recaption_token in cot_text
+        ):
+            system_prompt = _resolve_system_prompt(batch, bot_task, "en_recaption") or ""
 
         height = batch.height
         width = batch.width
