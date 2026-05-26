@@ -17,7 +17,6 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
-from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DiTConfig,
@@ -271,6 +270,32 @@ def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+class HunyuanImage3ARCache:
+    """Small dynamic KV cache for HunyuanImage3 text generation."""
+
+    def __init__(self, num_layers: int):
+        self.keys: list[torch.Tensor | None] = [None] * num_layers
+        self.values: list[torch.Tensor | None] = [None] * num_layers
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.keys[layer_idx] is None:
+            self.keys[layer_idx] = key_states
+            self.values[layer_idx] = value_states
+        else:
+            self.keys[layer_idx] = torch.cat(
+                [self.keys[layer_idx], key_states], dim=2
+            )
+            self.values[layer_idx] = torch.cat(
+                [self.values[layer_idx], value_states], dim=2
+            )
+        return self.keys[layer_idx], self.values[layer_idx]
 
 
 def apply_rotary_pos_emb(
@@ -768,12 +793,14 @@ class HunYuanAttention(nn.Module):
         use_qk_norm: bool = False,
         rms_norm_eps: float = 1e-5,
         bias: bool = False,
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.layer_idx = layer_idx
         self.q_size = num_heads * head_dim
         self.kv_size = num_kv_heads * head_dim
         self.scaling = head_dim**-0.5
@@ -791,6 +818,7 @@ class HunYuanAttention(nn.Module):
         hidden_states: torch.Tensor,
         rope_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
+        past_key_value: HunyuanImage3ARCache | None = None,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -822,6 +850,10 @@ class HunYuanAttention(nn.Module):
         if self.use_qk_norm:
             q = self.query_layernorm(q)
             k = self.key_layernorm(k)
+
+        if past_key_value is not None:
+            k, v = past_key_value.update(k, v, self.layer_idx)
+            q = q.to(k.dtype)
 
         # GQA: repeat kv heads
         if self.num_kv_heads < self.num_heads:
@@ -969,6 +1001,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             use_qk_norm=use_qk_norm,
             rms_norm_eps=rms_norm_eps,
             bias=attention_bias,
+            layer_idx=layer_idx,
         )
 
         use_moe = num_experts > 1 and layer_idx >= moe_layer_num_skipped
@@ -995,6 +1028,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         rope_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
+        past_key_value: HunyuanImage3ARCache | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1003,6 +1037,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             rope_2d=rope_2d,
             attention_mask=attention_mask,
+            past_key_value=past_key_value,
         )
         hidden_states = residual + hidden_states
 
@@ -1142,11 +1177,40 @@ class HunyuanImage3DiT(CachableDiT):
             extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
         )
 
+    def _forward_ar_text(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        rope_2d: tuple[torch.Tensor, torch.Tensor] | None = None,
+        past_key_values: HunyuanImage3ARCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, HunyuanImage3ARCache]:
+        """Forward text tokens through the root module for AR logits.
+
+        FSDP2 requires the root module forward hook to run before any sharded
+        child module is used.  Keeping AR generation behind ``forward`` avoids
+        initializing child layer FSDP states before the root state.
+        """
+        hidden_states = self.embed_tokens(input_ids)
+        cache = past_key_values if use_cache else None
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                rope_2d=rope_2d,
+                attention_mask=attention_mask,
+                past_key_value=cache,
+            )
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states[:, -1, :])
+        if use_cache:
+            return logits, cache
+        return logits
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        timestep: torch.Tensor | None = None,
+        encoder_hidden_states: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         image_scatter_index: torch.Tensor | None = None,
@@ -1160,6 +1224,8 @@ class HunyuanImage3DiT(CachableDiT):
         position_ids: torch.Tensor | None = None,
         token_h: int | None = None,
         token_w: int | None = None,
+        input_ids: torch.Tensor | None = None,
+        mode: str | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -1186,6 +1252,23 @@ class HunyuanImage3DiT(CachableDiT):
         Returns:
             Noise prediction [B, C, H, W].
         """
+        if mode == "ar_text":
+            if input_ids is None:
+                raise ValueError("input_ids must be provided for mode='ar_text'")
+            return self._forward_ar_text(
+                input_ids=input_ids,
+                attention_mask=encoder_attention_mask,
+                rope_2d=rope_2d,
+                past_key_values=kwargs.get("past_key_values"),
+                use_cache=kwargs.get("use_cache", False),
+            )
+
+        if hidden_states is None or timestep is None or encoder_hidden_states is None:
+            raise ValueError(
+                "hidden_states, timestep, and encoder_hidden_states are required "
+                "for HunyuanImage3 denoising forward"
+            )
+
         bsz = hidden_states.shape[0]
 
         # 1. Start with the full token sequence embeddings (already embedded by tokenizer)
@@ -1317,18 +1400,25 @@ class HunyuanImage3DiT(CachableDiT):
         """
         device = input_ids.device
         generated = input_ids.clone()
-        is_fsdp_root = isinstance(self, FSDPModule)
-        if is_fsdp_root:
-            self.unshard()
+        if max_new_tokens <= 0:
+            return generated
 
-        try:
-            for _ in range(max_new_tokens):
+        cache = HunyuanImage3ARCache(len(self.layers))
+        total_seq_len = generated.shape[1] + max_new_tokens
+        if rope_2d is not None and total_seq_len > rope_2d[0].shape[1]:
+            n_elem = rope_2d[0].shape[-1]
+            rope_2d = build_batch_2d_rope(
+                seq_len=total_seq_len,
+                n_elem=n_elem,
+                image_infos=None,
+                device=device,
+                base=self.rope_theta,
+            )
+
+        for step in range(max_new_tokens):
+            if step == 0:
                 seq_len = generated.shape[1]
-
-                # 1. Embed tokens
-                hidden_states = self.embed_tokens(generated)
-
-                # 2. Build attention mask for current sequence length
+                current_input_ids = generated
                 if seq_len > attention_mask.shape[-1]:
                     causal_mask = torch.triu(
                         torch.full((seq_len, seq_len), float("-inf"), device=device),
@@ -1336,76 +1426,66 @@ class HunyuanImage3DiT(CachableDiT):
                     ).unsqueeze(0).unsqueeze(0)
                 else:
                     causal_mask = attention_mask[:, :, :seq_len, :seq_len]
+                cur_rope_2d = (
+                    (rope_2d[0][:, :seq_len], rope_2d[1][:, :seq_len])
+                    if rope_2d is not None
+                    else None
+                )
+            else:
+                seq_pos = generated.shape[1] - 1
+                current_input_ids = generated[:, -1:]
+                causal_mask = None
+                cur_rope_2d = (
+                    (rope_2d[0][:, seq_pos : seq_pos + 1], rope_2d[1][:, seq_pos : seq_pos + 1])
+                    if rope_2d is not None
+                    else None
+                )
 
-                # 3. Build RoPE for current sequence length
-                if rope_2d is not None and seq_len > rope_2d[0].shape[1]:
-                    n_elem = rope_2d[0].shape[-1]
-                    new_cos, new_sin = build_batch_2d_rope(
-                        seq_len=seq_len,
-                        n_elem=n_elem,
-                        image_infos=None,
-                        device=device,
-                        base=self.rope_theta,
+            outputs = self(
+                input_ids=current_input_ids,
+                encoder_attention_mask=causal_mask,
+                rope_2d=cur_rope_2d,
+                mode="ar_text",
+                past_key_values=cache,
+                use_cache=True,
+            )
+            logits, cache = outputs
+
+            # 1. Apply logits processor
+            if logits_processor is not None:
+                logits = logits_processor(logits, generated)
+
+            # 2. Sample next token
+            if top_k == 1:
+                next_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
+            else:
+                logits = logits / max(temperature, 1e-8)
+                if top_k > 1:
+                    top_k_val = min(top_k, logits.size(-1))
+                    topk_vals, _ = torch.topk(logits, top_k_val)
+                    logits[logits < topk_vals[:, -1:]] = float("-inf")
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(
+                        torch.softmax(sorted_logits, dim=-1), dim=-1
                     )
-                    cur_rope_2d = (new_cos, new_sin)
-                elif rope_2d is not None:
-                    cur_rope_2d = (
-                        rope_2d[0][:, :seq_len],
-                        rope_2d[1][:, :seq_len],
+                    sorted_mask = cumulative_probs - torch.softmax(
+                        sorted_logits, dim=-1
+                    ) >= top_p
+                    sorted_logits[sorted_mask] = float("-inf")
+                    logits = torch.full_like(logits, float("-inf")).scatter(
+                        1, sorted_indices, sorted_logits
                     )
-                else:
-                    cur_rope_2d = None
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
 
-                # 4. Pass through transformer layers
-                for layer in self.layers:
-                    hidden_states = layer(
-                        hidden_states=hidden_states,
-                        rope_2d=cur_rope_2d,
-                        attention_mask=causal_mask,
-                    )
+            generated = torch.cat([generated, next_token], dim=1)
 
-                # 5. Norm + lm_head to get logits
-                hidden_states = self.norm(hidden_states)
-                logits = self.lm_head(hidden_states[:, -1, :])  # [1, vocab_size]
-
-                # 6. Apply logits processor
-                if logits_processor is not None:
-                    logits = logits_processor(logits, generated)
-
-                # 7. Sample next token
-                if top_k == 1:
-                    next_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
-                else:
-                    logits = logits / max(temperature, 1e-8)
-                    if top_k > 1:
-                        top_k_val = min(top_k, logits.size(-1))
-                        topk_vals, _ = torch.topk(logits, top_k_val)
-                        logits[logits < topk_vals[:, -1:]] = float("-inf")
-                    if top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                        cumulative_probs = torch.cumsum(
-                            torch.softmax(sorted_logits, dim=-1), dim=-1
-                        )
-                        sorted_mask = cumulative_probs - torch.softmax(
-                            sorted_logits, dim=-1
-                        ) >= top_p
-                        sorted_logits[sorted_mask] = float("-inf")
-                        logits = sorted_logits.scatter(
-                            1, sorted_indices, sorted_logits
-                        )
-                    probs = torch.softmax(logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-
-                generated = torch.cat([generated, next_token], dim=1)
-
-                # 8. Check stopping conditions
-                if eos_token_id is not None and next_token.item() == eos_token_id:
-                    break
-                if stop_token_ids is not None and next_token.item() in stop_token_ids:
-                    break
-        finally:
-            if is_fsdp_root:
-                self.reshard()
+            # 3. Check stopping conditions
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+            if stop_token_ids is not None and next_token.item() in stop_token_ids:
+                break
 
         return generated
 

@@ -144,10 +144,17 @@ class HunyuanImage3Tokenizer:
         # Instruct template tokens
         self.answer_token_id = self.special_token_map.get("<answer>", None)
         self.end_of_answer_token_id = self.special_token_map.get("</answer>", None)
-        self.think_token_id = self.special_token_map.get("ჼ", None)  # think start
+        self.think_token = "<think>"
+        self.end_of_think_token = "</think>"
+        self.recaption_token = "<recaption>"
+        self.end_of_recaption_token = "</recaption>"
+        self.think_token_id = self.special_token_map.get(
+            self.think_token, self.special_token_map.get("ჼ", None)
+        )
         self.end_of_think_token_id = self.special_token_map.get(
-            "ebil_think", None
-        )  # think end
+            self.end_of_think_token,
+            self.special_token_map.get("ebil_think", None),
+        )
         self.recaption_token_id = self.special_token_map.get("<recaption>", None)
         self.end_of_recaption_token_id = self.special_token_map.get(
             "</recaption>", None
@@ -169,6 +176,55 @@ class HunyuanImage3Tokenizer:
             text_tokens = text_tokens[:max_length]
 
         return text_tokens
+
+    def _append_prompt_sections(self, sections, prompt, system_prompt, uncond_kwargs, template):
+        if template == "instruct":
+            if system_prompt:
+                sections.append(dict(type="text", text=system_prompt))
+                sections.append(dict(type="text", text="\n\n"))
+            sections.append(dict(type="text", text="User: "))
+            sections.append(dict(type="text", text=prompt, **uncond_kwargs))
+            sections.append(dict(type="text", text="\n\n"))
+            sections.append(dict(type="text", text="Assistant: "))
+        else:
+            if system_prompt:
+                sections.append(dict(type="text", text=system_prompt))
+            sections.append(dict(type="text", text=prompt, **uncond_kwargs))
+
+    def _append_cot_sections(self, sections, cot_text, uncond_kwargs, drop_think=False):
+        if not cot_text:
+            return
+
+        if self.think_token in cot_text and self.end_of_think_token in cot_text:
+            before_think = cot_text.split(self.think_token, 1)[0]
+            after_start = cot_text.split(self.think_token, 1)[1]
+            think_text, after_think = after_start.split(self.end_of_think_token, 1)
+            self._append_cot_sections(sections, before_think, uncond_kwargs, drop_think)
+            if not drop_think:
+                sections.append(dict(type="text", text=self.think_token, ignore=True))
+                sections.append(dict(type="text", text=think_text, **uncond_kwargs))
+                sections.append(dict(type="text", text=self.end_of_think_token))
+            self._append_cot_sections(sections, after_think, uncond_kwargs, drop_think)
+            return
+
+        if self.recaption_token in cot_text and self.end_of_recaption_token in cot_text:
+            before_recaption = cot_text.split(self.recaption_token, 1)[0]
+            after_start = cot_text.split(self.recaption_token, 1)[1]
+            recaption_text, after_recaption = after_start.split(
+                self.end_of_recaption_token, 1
+            )
+            self._append_cot_sections(
+                sections, before_recaption, uncond_kwargs, drop_think
+            )
+            sections.append(dict(type="text", text=self.recaption_token, ignore=True))
+            sections.append(dict(type="text", text=recaption_text, **uncond_kwargs))
+            sections.append(dict(type="text", text=self.end_of_recaption_token))
+            self._append_cot_sections(
+                sections, after_recaption, uncond_kwargs, drop_think
+            )
+            return
+
+        sections.append(dict(type="text", text=cot_text, **uncond_kwargs))
 
     def _add_image_meta_tokens(
         self,
@@ -222,36 +278,21 @@ class HunyuanImage3Tokenizer:
         Args:
             template: "pretrain" or "instruct".
                 pretrain: <bos> [system] [user] [cot] <boi> <img_size> <img_ratio>
-                          <timestep> <img>*N <eoi> <eos>
-                instruct: <bos> [system]\n\n User: [user]\n\n Assistant: [cot]
+                          <timestep> <img>*N <eoi>
+                instruct: <bos> [system]\n\nUser: [user]\n\nAssistant: [cot]
                           <answer> <boi> <img_size> <img_ratio> <timestep>
-                          <img>*N <eoi> </answer> <eos>
+                          <img>*N <eoi> </answer>
         """
         uncond_kwargs = dict(uncond_p=uncond_p)
 
         sections = []
 
-        if template == "instruct":
-            # Instruct template: add role prefixes and answer tags
-            if system_prompt:
-                sections.append(dict(type="text", text=system_prompt))
-            sections.append(
-                dict(type="text", text=f"\n\n User: {prompt}\n\n Assistant: ", **uncond_kwargs)
-            )
-            if cot_text:
-                sections.append(dict(type="text", text=cot_text, **uncond_kwargs))
-            # <answer> before image
-            if self.answer_token_id is not None:
-                sections.append(
-                    dict(type="text", text="<answer>", ignore=True, **uncond_kwargs)
-                )
-        else:
-            # Pretrain template: no role prefixes
-            if system_prompt:
-                sections.append(dict(type="text", text=system_prompt))
-            sections.append(dict(type="text", text=prompt, **uncond_kwargs))
-            if cot_text:
-                sections.append(dict(type="text", text=cot_text, **uncond_kwargs))
+        self._append_prompt_sections(
+            sections, prompt, system_prompt, uncond_kwargs, template
+        )
+        self._append_cot_sections(sections, cot_text, uncond_kwargs)
+        if template == "instruct" and self.answer_token_id is not None:
+            sections.append(dict(type="text", text="<answer>", ignore=True))
 
         # Generated image
         image_token_length = token_h * token_w
@@ -268,11 +309,11 @@ class HunyuanImage3Tokenizer:
             )
         )
 
-        # </answer> after image (instruct template)
-        if template == "instruct" and self.end_of_answer_token_id is not None:
-            sections.append(
-                dict(type="text", text="</answer>", ignore=True, **uncond_kwargs)
-            )
+        # </answer> and assistant separator after image (instruct template)
+        if template == "instruct":
+            if self.end_of_answer_token_id is not None:
+                sections.append(dict(type="text", text="</answer>", ignore=True))
+            sections.append(dict(type="text", text="\n\n"))
 
         return self._encode_sections(sections)
 
@@ -332,24 +373,12 @@ class HunyuanImage3Tokenizer:
         uncond_kwargs = dict(uncond_p=uncond_p)
         sections = []
 
-        if template == "instruct":
-            if system_prompt:
-                sections.append(dict(type="text", text=system_prompt))
-            sections.append(
-                dict(type="text", text=f"\n\n User: {prompt}\n\n Assistant: ", **uncond_kwargs)
-            )
-            if cot_text:
-                sections.append(dict(type="text", text=cot_text, **uncond_kwargs))
-            if self.answer_token_id is not None:
-                sections.append(
-                    dict(type="text", text="<answer>", ignore=True, **uncond_kwargs)
-                )
-        else:
-            if system_prompt:
-                sections.append(dict(type="text", text=system_prompt))
-            sections.append(dict(type="text", text=prompt, **uncond_kwargs))
-            if cot_text:
-                sections.append(dict(type="text", text=cot_text, **uncond_kwargs))
+        self._append_prompt_sections(
+            sections, prompt, system_prompt, uncond_kwargs, template
+        )
+        self._append_cot_sections(sections, cot_text, uncond_kwargs)
+        if template == "instruct" and self.answer_token_id is not None:
+            sections.append(dict(type="text", text="<answer>", ignore=True))
 
         # Add joint_image sections for each condition image
         for info in cond_image_infos:
@@ -382,10 +411,10 @@ class HunyuanImage3Tokenizer:
             )
         )
 
-        if template == "instruct" and self.end_of_answer_token_id is not None:
-            sections.append(
-                dict(type="text", text="</answer>", ignore=True, **uncond_kwargs)
-            )
+        if template == "instruct":
+            if self.end_of_answer_token_id is not None:
+                sections.append(dict(type="text", text="</answer>", ignore=True))
+            sections.append(dict(type="text", text="\n\n"))
 
         return self._encode_sections(sections)
 
@@ -564,7 +593,7 @@ class HunyuanImage3Tokenizer:
         )
 
     def _build_token_sequence(
-        self, template, token_source, add_bos=True, add_eos=True
+        self, template, token_source, add_bos=True, add_eos=False
     ):
         """Build the full token sequence from template and token source.
 
@@ -723,8 +752,8 @@ class HunyuanImage3Tokenizer:
     ):
         """Build the AR input token sequence (text prefix only, no image placeholders).
 
-        pretrain: <bos> [system] [prompt] Ⴟ
-        instruct: <bos> [system]\\n\\n User: [prompt]\\n\\n Assistant: Ⴟ
+        pretrain: <bos> [system] [prompt] [trigger]
+        instruct: <bos> [system]\\n\\nUser: [prompt]\\n\\nAssistant: [trigger]
 
         Returns:
             dict with input_ids [1, seq_len], attention_mask, position_ids.
@@ -734,19 +763,20 @@ class HunyuanImage3Tokenizer:
         if template == "instruct":
             if system_prompt:
                 token_seq.extend(self.encode_text(system_prompt))
-                token_seq.extend(self.encode_text("\n\n User: "))
-            else:
-                token_seq.extend(self.encode_text("User: "))
+                token_seq.extend(self.encode_text("\n\n"))
+            token_seq.extend(self.encode_text("User: "))
             token_seq.extend(self.encode_text(prompt))
-            token_seq.extend(self.encode_text("\n\n Assistant: "))
+            token_seq.extend(self.encode_text("\n\n"))
+            token_seq.extend(self.encode_text("Assistant: "))
         else:
             if system_prompt:
                 token_seq.extend(self.encode_text(system_prompt))
             token_seq.extend(self.encode_text(prompt))
 
-        # Add think start token (ჼ) if bot_task includes think
         if bot_task in ("think", "think_recaption") and self.think_token_id is not None:
             token_seq.append(self.think_token_id)
+        elif bot_task == "recaption" and self.recaption_token_id is not None:
+            token_seq.append(self.recaption_token_id)
 
         input_ids = torch.tensor([token_seq], dtype=torch.long)
         seq_len = input_ids.shape[1]
@@ -760,9 +790,9 @@ class HunyuanImage3Tokenizer:
     def parse_cot_text(self, cot_text):
         """Parse CoT text into sections list for _encode_sections.
 
-        Input: "Ⴟthink contentebil_think<recaption>recaption content</recaption>"
+        Input: "<think>think content</think><recaption>recaption content</recaption>"
         Output: [
-            dict(type="text", text="Ⴟthink contentebil_think"),
+            dict(type="text", text="<think>think content</think>"),
             dict(type="text", text="<recaption>recaption content</recaption>"),
         ]
         """
@@ -826,6 +856,7 @@ class StageTransitionLogitsProcessor:
     def __init__(self, transitions):
         self.transitions = transitions
         self._forced_queue = []
+        self._completed = set()
 
     def __call__(self, logits, input_ids):
         # If we have forced tokens in the queue, apply them
@@ -837,7 +868,8 @@ class StageTransitionLogitsProcessor:
 
         # Check if the last token triggers a transition
         last_token = input_ids[0, -1].item()
-        if last_token in self.transitions:
+        if last_token in self.transitions and last_token not in self._completed:
+            self._completed.add(last_token)
             forced_tokens = self.transitions[last_token]
             if len(forced_tokens) > 0:
                 # Force the first token now, queue the rest
@@ -862,9 +894,10 @@ class ConditionalSliceVocabLogitsProcessor:
         allowed_token_ids: List of token IDs allowed after the trigger.
     """
 
-    def __init__(self, trigger_token_id, allowed_token_ids):
+    def __init__(self, trigger_token_id, allowed_token_ids, force_greedy=False):
         self.trigger_token_id = trigger_token_id
         self.allowed_token_ids = allowed_token_ids
+        self.force_greedy = force_greedy
 
     def __call__(self, logits, input_ids):
         last_token = input_ids[0, -1].item()
@@ -872,6 +905,10 @@ class ConditionalSliceVocabLogitsProcessor:
             mask = torch.full_like(logits, float("-inf"))
             mask[0, self.allowed_token_ids] = 0.0
             logits = logits + mask
+            if self.force_greedy:
+                max_token_id = logits[0].argmax().item()
+                logits[:] = float("-inf")
+                logits[0, max_token_id] = 0.0
         return logits
 
 
@@ -932,7 +969,7 @@ You will act as a top-tier Text-to-Image AI. Your core task is to deeply analyze
 
 Your workflow is divided into two phases:
 
-1. Thinking Phase ( cancelButtonTitle): In the  tag, you need to conduct a structured thinking process, progressively breaking down and enriching the constituent elements of the image. This process must include, but is not limited to, the following dimensions:
+1. Thinking Phase (<think>): In the <think> tag, you need to conduct a structured thinking process, progressively breaking down and enriching the constituent elements of the image. This process must include, but is not limited to, the following dimensions:
 
 Subject: Clearly define the core character(s) or object(s) in the scene, including their appearance, posture, expression, and emotion.
 Composition: Set the camera angle and layout, such as close-up, long shot, bird's-eye view, golden ratio composition, etc.
@@ -956,8 +993,7 @@ Use Rich and Specific Descriptive Language: Use precise adjectives to describe t
 
 
 Output Format:
-Thinking process..
-<recaption>Refined image description</recaption>Generate Image
+<think>Thinking process</think><recaption>Refined image description</recaption>Generate Image
 
 
 You must strictly adhere to the following rules:
@@ -990,14 +1026,14 @@ You will operate in one of two modes, determined by the user's starting tag:
 *   **Task:** Immediately rewrite the user's text into a structured, objective, and detail-rich professional-grade prompt.
 *   **Output:** Output only the rewritten prompt within `<recaption>` tags: `<recaption>Rewritten professional-grade prompt</recaption>`
 
-#### ** Mode (Think + Rewrite)**:
-*   **Trigger:** Input begins with ``.
-*   **Task:** First, conduct a structured analysis of the request within `` tags. Then, output the professional prompt, rewritten based on the analysis, within `<recaption>` tags.
-*   **Output:** Strictly adhere to the format: `Analysis process..<recaption>Rewritten prompt</recaption>`
+#### **<think> Mode (Think + Rewrite)**:
+*   **Trigger:** Input begins with `<think>`.
+*   **Task:** First, conduct a structured analysis of the request within `<think>` tags. Then, output the professional prompt, rewritten based on the analysis, within `<recaption>` tags.
+*   **Output:** Strictly adhere to the format: `<think>Analysis process</think><recaption>Rewritten prompt</recaption>`
 
 ---
 ### Execution Standards and Guidelines
-#### **`` Phase: Analysis Guidelines**
+#### **`<think>` Phase: Analysis Guidelines**
 **For T2I (New Image Generation):**
 Deconstruct the user's request into the following core visual components:
 *   **Subject:** Key features of the main character/object, including appearance, pose, expression, and emotion.
@@ -1063,27 +1099,26 @@ def _resolve_system_prompt(batch, bot_task="", sys_type="dynamic"):
     custom_prompt = getattr(batch, "system_prompt", "") or ""
 
     if sys_type == "None":
-        return None
+        prompt = None
     elif sys_type == "en_unified":
-        return unified_system_prompt_en
+        prompt = unified_system_prompt_en
     elif sys_type in t2i_system_prompts:
         prompt = t2i_system_prompts[sys_type]
-        if sys_type == "en_vanilla":
-            prompt = prompt.strip("\n")
-        return prompt
     elif sys_type == "dynamic":
-        if bot_task == "think":
-            return t2i_system_prompts["en_think_recaption"]
+        if bot_task in ("think", "think_recaption"):
+            prompt = t2i_system_prompts["en_think_recaption"]
         elif bot_task == "recaption":
-            return t2i_system_prompts["en_recaption"]
+            prompt = t2i_system_prompts["en_recaption"]
         elif bot_task == "image":
-            return t2i_system_prompt_en_vanilla.strip("\n")
+            prompt = t2i_system_prompt_en_vanilla
         else:
-            return custom_prompt
+            prompt = custom_prompt
     elif sys_type == "custom":
-        return custom_prompt
+        prompt = custom_prompt
     else:
         raise NotImplementedError(f"Unsupported system prompt type: {sys_type}")
+
+    return prompt.strip() if prompt is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -1195,6 +1230,64 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             attention_mask[img_slice, img_slice] = True
         return attention_mask.unsqueeze(0).unsqueeze(0)
 
+    @staticmethod
+    def _normalize_bot_task(bot_task):
+        bot_task = bot_task or ""
+        if bot_task in ("none", "vanilla"):
+            return ""
+        return bot_task
+
+    @staticmethod
+    def _is_auto_image_size(image_size):
+        return image_size is None or str(image_size).strip().lower() == "auto"
+
+    def _parse_requested_image_size(self, image_size):
+        """Parse official HunyuanImage3 image_size formats.
+
+        Returns (width, height, ratio_index).  For auto mode, all values are
+        None so the AR ratio predictor can choose the bucket.
+        """
+        if self._is_auto_image_size(image_size):
+            return None, None, None
+
+        if isinstance(image_size, str):
+            value = image_size.strip()
+            if value.startswith("<img_ratio_") and value.endswith(">"):
+                ratio_index = int(value[len("<img_ratio_") : -1])
+                reso = self.resolution_group[ratio_index]
+                return reso.w, reso.h, ratio_index
+            if "x" in value:
+                height, width = [int(part) for part in value.lower().split("x", 1)]
+                return width, height, None
+            if ":" in value:
+                width, height = [int(part) for part in value.split(":", 1)]
+                return width, height, None
+            raise ValueError(
+                "`image_size` should be 'auto', 'HxW', 'W:H', or '<img_ratio_i>', "
+                f"got {image_size!r}."
+            )
+
+        if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
+            height, width = [int(part) for part in image_size]
+            return width, height, None
+
+        raise ValueError(
+            "`image_size` should be 'auto', 'HxW', 'W:H', '<img_ratio_i>', "
+            f"or a 2-item sequence, got {image_size!r}."
+        )
+
+    def _cot_stop_token_ids(self, bot_task, need_ratio):
+        tw = self.tokenizer_wrapper
+        if need_ratio:
+            return tw.get_ratio_token_ids()
+        if bot_task in ("recaption", "think_recaption"):
+            stop_ids = [tw.end_of_recaption_token_id]
+        elif bot_task == "think":
+            stop_ids = [tw.end_of_think_token_id, tw.end_of_recaption_token_id]
+        else:
+            stop_ids = [tw.eos_token_id]
+        return [token_id for token_id in stop_ids if token_id is not None]
+
     # ------------------------------------------------------------------
     # AR generation (conditional sub-step)
     # ------------------------------------------------------------------
@@ -1207,8 +1300,8 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         ``batch.cot_text`` and ``batch.ratio_index`` for use by the
         downstream token-sequence construction.
         """
-        bot_task = getattr(batch, "bot_task", "") or ""
-        if not bot_task:
+        bot_task = self._normalize_bot_task(getattr(batch, "bot_task", ""))
+        if bot_task not in ("think", "recaption", "think_recaption"):
             return
 
         device = get_local_torch_device()
@@ -1219,6 +1312,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         sys_type = getattr(batch, "sys_type", "dynamic") or "dynamic"
         system_prompt = _resolve_system_prompt(batch, bot_task, sys_type)
         base_size = dit_config.image_base_size
+        need_ratio = self._is_auto_image_size(getattr(batch, "image_size", "auto"))
 
         # 2. Build AR input sequence
         prompt = batch.prompt if isinstance(batch.prompt, str) else batch.prompt[0]
@@ -1250,7 +1344,9 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         rope_2d = (rope_cos, rope_sin)
 
         # 5. Configure stage transitions and logits processors
-        transitions = self._build_stage_transitions(bot_task, template, base_size)
+        transitions = self._build_stage_transitions(
+            bot_task, template, base_size, need_ratio
+        )
         ratio_token_ids = self.tokenizer_wrapper.get_ratio_token_ids()
         img_size_token_id = self.tokenizer_wrapper.special_token_map.get(
             f"<img_size_{base_size}>", None
@@ -1264,6 +1360,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
                 ConditionalSliceVocabLogitsProcessor(
                     trigger_token_id=img_size_token_id,
                     allowed_token_ids=ratio_token_ids,
+                    force_greedy=True,
                 )
             )
 
@@ -1290,13 +1387,15 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             top_p=getattr(batch, "ar_top_p", 1.0),
             top_k=getattr(batch, "ar_top_k", 1),
             eos_token_id=self.tokenizer_wrapper.eos_token_id,
-            stop_token_ids=ratio_token_ids if ratio_token_ids else None,
+            stop_token_ids=self._cot_stop_token_ids(bot_task, need_ratio),
             logits_processor=logits_processor,
         )
 
         # 7. Parse output: extract cot_text and ratio_index
         input_len = input_ids.shape[1]
-        cot_text, ratio_index = self._parse_ar_output(generated_ids[0], input_len)
+        cot_text, ratio_index = self._parse_ar_output(
+            generated_ids[0], input_len, bot_task
+        )
         batch.cot_text = cot_text
         if ratio_index is not None:
             batch.ratio_index = ratio_index
@@ -1326,18 +1425,28 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         sys_type = getattr(batch, "sys_type", "dynamic") or "dynamic"
         system_prompt = _resolve_system_prompt(batch, "image", sys_type)
 
-        # 2. Build minimal AR input: prompt only (no think/recaption prefix)
+        # 2. Build minimal AR input with the official img_ratio prefix.
         prompt = batch.prompt if isinstance(batch.prompt, str) else batch.prompt[0]
         ar_input = tw.build_ar_sequence(
             prompt=prompt,
             system_prompt=system_prompt or "",
-            bot_task="",  # no think prefix
+            bot_task="",
             template=template,
             base_size=base_size,
         )
+        img_size_token_id = tw.special_token_map.get(f"<img_size_{base_size}>", None)
+        if img_size_token_id is None or tw.boi_token_id is None:
+            raise ValueError(f"Missing image ratio prefix token(s) for base_size={base_size}")
+
+        ratio_prefix = []
+        if template == "instruct" and tw.answer_token_id is not None:
+            ratio_prefix.append(tw.answer_token_id)
+        ratio_prefix.extend([tw.boi_token_id, img_size_token_id])
 
         # 3. Build causal attention mask
-        input_ids = ar_input["input_ids"].to(device)
+        input_ids = ar_input["input_ids"]
+        prefix_tensor = torch.tensor([ratio_prefix], dtype=input_ids.dtype)
+        input_ids = torch.cat([input_ids, prefix_tensor], dim=1).to(device)
         seq_len = input_ids.shape[1]
         causal_mask = torch.triu(
             torch.full((seq_len, seq_len), float("-inf"), device=device),
@@ -1355,34 +1464,15 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         )
         rope_2d = (rope_cos, rope_sin)
 
-        # 5. Build stage transitions: force <answer><boi><img_size_*> after prompt
-        img_size_token_id = tw.special_token_map.get(f"<img_size_{base_size}>", None)
-        transitions = {}
-        if template == "instruct" and tw.answer_token_id is not None:
-            # Force <answer><boi><img_size_*>
-            if tw.eos_token_id is not None:
-                forced = [tw.answer_token_id, tw.boi_token_id]
-                if img_size_token_id is not None:
-                    forced.append(img_size_token_id)
-                transitions[tw.eos_token_id] = forced
-        else:
-            # Force <boi><img_size_*>
-            if tw.eos_token_id is not None and tw.boi_token_id is not None:
-                forced = [tw.boi_token_id]
-                if img_size_token_id is not None:
-                    forced.append(img_size_token_id)
-                transitions[tw.eos_token_id] = forced
-
-        # 6. Configure logits processors
+        # 5. Restrict the next token after <img_size_*> to ratio tokens.
         ratio_token_ids = tw.get_ratio_token_ids()
         processors = []
-        if transitions:
-            processors.append(StageTransitionLogitsProcessor(transitions))
         if img_size_token_id is not None and ratio_token_ids:
             processors.append(
                 ConditionalSliceVocabLogitsProcessor(
                     trigger_token_id=img_size_token_id,
                     allowed_token_ids=ratio_token_ids,
+                    force_greedy=True,
                 )
             )
 
@@ -1402,8 +1492,8 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             input_ids=input_ids,
             attention_mask=causal_mask,
             rope_2d=rope_2d,
-            position_ids=ar_input["position_ids"].to(device),
-            max_new_tokens=10,  # only need a few tokens for ratio
+            position_ids=torch.arange(seq_len, device=device).unsqueeze(0),
+            max_new_tokens=1,
             temperature=1.0,
             top_p=1.0,
             top_k=1,
@@ -1609,25 +1699,28 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
         return cond_vae_images, cond_timestep, cond_vit_embeds, cond_image_info_list
 
-    def _build_stage_transitions(self, bot_task, template, base_size):
+    def _build_stage_transitions(self, bot_task, template, base_size, need_ratio=True):
         """Build stage transitions config based on bot_task and template."""
         transitions = {}
         tw = self.tokenizer_wrapper
 
         if bot_task in ("think", "think_recaption"):
-            # After think ends (ebil_think), force <recaption> or <boi>
+            # After thinking, continue to recaption or to ratio prediction.
             if tw.end_of_think_token_id is not None:
                 if bot_task == "think_recaption" and tw.recaption_token_id is not None:
                     transitions[tw.end_of_think_token_id] = [tw.recaption_token_id]
-                elif tw.boi_token_id is not None:
-                    # think only: after think, go to <boi>
+                elif need_ratio and tw.boi_token_id is not None:
                     img_size_id = tw.special_token_map.get(f"<img_size_{base_size}>")
-                    forced = [tw.boi_token_id]
+                    forced = (
+                        [tw.answer_token_id, tw.boi_token_id]
+                        if template == "instruct" and tw.answer_token_id is not None
+                        else [tw.boi_token_id]
+                    )
                     if img_size_id is not None:
                         forced.append(img_size_id)
                     transitions[tw.end_of_think_token_id] = forced
 
-        if bot_task in ("recaption", "think_recaption"):
+        if need_ratio and bot_task in ("recaption", "think_recaption"):
             # After </recaption>, force <answer><boi><img_size> or <boi><img_size>
             if tw.end_of_recaption_token_id is not None:
                 img_size_id = tw.special_token_map.get(f"<img_size_{base_size}>")
@@ -1641,7 +1734,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
         return transitions if transitions else None
 
-    def _parse_ar_output(self, generated_ids, input_len):
+    def _parse_ar_output(self, generated_ids, input_len, bot_task=None):
         """Parse AR output to extract cot_text and ratio_index.
 
         Uses input_len to identify where the input prefix ends, then extracts
@@ -1675,6 +1768,15 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
         # Decode generated tokens to text
         cot_text = tw.tokenizer.decode(gen_tokens.tolist(), skip_special_tokens=False)
+        if cot_text:
+            if bot_task in ("think", "think_recaption") and not cot_text.startswith(
+                tw.think_token
+            ):
+                cot_text = tw.think_token + cot_text
+            elif bot_task == "recaption" and not cot_text.startswith(
+                tw.recaption_token
+            ):
+                cot_text = tw.recaption_token + cot_text
 
         # Truncate at CoT end markers
         cot_text = self._truncate_at_cot_end(cot_text)
@@ -1708,13 +1810,13 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
     @staticmethod
     def _truncate_at_cot_end(cot_text):
-        """Truncate AR output at first </recaption> or ebil_think.
+        """Truncate AR output at first CoT end marker.
 
         Mirrors vllm-omni's _truncate_at_cot_end: the trailing
         <answer><boi><img_size_*><img_ratio_*> is consumed via
         height/width extraction and must not leak into the DiT prompt.
         """
-        for marker in ("</recaption>", "ebil_think"):
+        for marker in ("</recaption>", "</think>", "ebil_think"):
             idx = cot_text.find(marker)
             if idx != -1:
                 return cot_text[: idx + len(marker)]
@@ -1725,20 +1827,17 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         """Strip the think portion from CoT text when drop_think=True.
 
         Handles formats like:
-            <think_token>think_contentebil_think<recaption>recaption_content</recaption>
+            <think>think_content</think><recaption>recaption_content</recaption>
         When drop_think=True, strips the <think_token>...ebil_think portion and
         keeps only <recaption>...</recaption>.
         """
         if not drop_think or not cot_text:
             return cot_text
 
-        # ebil_think is the end-of-think marker
-        think_end_marker = "ebil_think"
-        think_end = cot_text.find(think_end_marker)
-        if think_end != -1:
-            # Keep everything after ebil_think
-            after_think = cot_text[think_end + len(think_end_marker):]
-            return after_think
+        for think_end_marker in ("</think>", "ebil_think"):
+            think_end = cot_text.find(think_end_marker)
+            if think_end != -1:
+                return cot_text[think_end + len(think_end_marker):]
 
         return cot_text
 
@@ -1753,12 +1852,19 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         device = get_local_torch_device()
         dtype = torch.bfloat16
 
+        batch.bot_task = self._normalize_bot_task(getattr(batch, "bot_task", ""))
+        image_size = getattr(batch, "image_size", "auto") or "auto"
+        requested_width, requested_height, requested_ratio_index = (
+            self._parse_requested_image_size(image_size)
+        )
+        if requested_ratio_index is not None:
+            batch.ratio_index = requested_ratio_index
+
         # 0. Optional AR generation (Hybrid: consolidated into this stage)
         self._run_ar_generation(batch, server_args)
 
         # 0b. If no ratio_index predicted yet and image_size="auto", run ratio prediction
-        image_size = getattr(batch, "image_size", "auto") or "auto"
-        if image_size == "auto" and (
+        if self._is_auto_image_size(image_size) and (
             not hasattr(batch, "ratio_index") or batch.ratio_index is None
         ):
             self._run_ratio_prediction(batch, server_args)
@@ -1779,6 +1885,9 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
         height = batch.height
         width = batch.width
+        if requested_width is not None and requested_height is not None:
+            width = requested_width
+            height = requested_height
         guidance_scale = batch.guidance_scale
         num_inference_steps = batch.num_inference_steps
         seed = batch.seed
@@ -1791,6 +1900,8 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
         # 2. Get target resolution from bucket
         target_w, target_h = self.resolution_group.get_target_size(width, height)
+        batch.width = int(target_w)
+        batch.height = int(target_h)
 
         # 3. Calculate token dimensions
         dit_config = server_args.pipeline_config.dit_config.arch_config
