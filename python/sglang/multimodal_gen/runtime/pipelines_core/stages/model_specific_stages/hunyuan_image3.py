@@ -238,6 +238,22 @@ class HunyuanImage3Tokenizer:
             "</recaption>", None
         )
 
+        conv = getattr(tokenizer, "conversation", None)
+        if (
+            conv is not None
+            and hasattr(conv, "get_role_prefix")
+            and hasattr(conv, "roles")
+        ):
+            self.instruct_user_prefix = conv.get_role_prefix(conv.roles[0])
+            self.instruct_assistant_prefix = conv.get_role_prefix(conv.roles[1])
+            self.instruct_user_sep = conv.sep
+            self.instruct_assistant_sep = conv.sep2 or conv.sep
+        else:
+            self.instruct_user_prefix = "User: "
+            self.instruct_assistant_prefix = "Assistant: "
+            self.instruct_user_sep = "\n\n"
+            self.instruct_assistant_sep = tokenizer.eos_token or "\n\n"
+
     def encode_text(self, text, uncond_p=0.0, max_length=None):
         """Encode text, optionally replacing with <cfg> tokens for unconditional."""
         do_uncond = (uncond_p == 1.0) or (uncond_p > 0 and random.random() < uncond_p)
@@ -259,11 +275,11 @@ class HunyuanImage3Tokenizer:
         if template == "instruct":
             if system_prompt:
                 sections.append(dict(type="text", text=system_prompt))
-                sections.append(dict(type="text", text="\n\n"))
-            sections.append(dict(type="text", text="User: "))
+                sections.append(dict(type="text", text=self.instruct_user_sep))
+            sections.append(dict(type="text", text=self.instruct_user_prefix))
             sections.append(dict(type="text", text=prompt, **uncond_kwargs))
-            sections.append(dict(type="text", text="\n\n"))
-            sections.append(dict(type="text", text="Assistant: "))
+            sections.append(dict(type="text", text=self.instruct_user_sep))
+            sections.append(dict(type="text", text=self.instruct_assistant_prefix))
         else:
             if system_prompt:
                 sections.append(dict(type="text", text=system_prompt))
@@ -391,7 +407,7 @@ class HunyuanImage3Tokenizer:
         if template == "instruct":
             if self.end_of_answer_token_id is not None:
                 sections.append(dict(type="text", text="</answer>", ignore=True))
-            sections.append(dict(type="text", text="\n\n"))
+            sections.append(dict(type="text", text=self.instruct_assistant_sep))
 
         return self._encode_sections(sections)
 
@@ -492,7 +508,7 @@ class HunyuanImage3Tokenizer:
         if template == "instruct":
             if self.end_of_answer_token_id is not None:
                 sections.append(dict(type="text", text="</answer>", ignore=True))
-            sections.append(dict(type="text", text="\n\n"))
+            sections.append(dict(type="text", text=self.instruct_assistant_sep))
 
         return self._encode_sections(sections)
 
@@ -841,11 +857,11 @@ class HunyuanImage3Tokenizer:
         if template == "instruct":
             if system_prompt:
                 token_seq.extend(self.encode_text(system_prompt))
-                token_seq.extend(self.encode_text("\n\n"))
-            token_seq.extend(self.encode_text("User: "))
+                token_seq.extend(self.encode_text(self.instruct_user_sep))
+            token_seq.extend(self.encode_text(self.instruct_user_prefix))
             token_seq.extend(self.encode_text(prompt))
-            token_seq.extend(self.encode_text("\n\n"))
-            token_seq.extend(self.encode_text("Assistant: "))
+            token_seq.extend(self.encode_text(self.instruct_user_sep))
+            token_seq.extend(self.encode_text(self.instruct_assistant_prefix))
         else:
             if system_prompt:
                 token_seq.extend(self.encode_text(system_prompt))
@@ -1290,15 +1306,30 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         if not tokenizer_output.all_image_slices:
             return None
         if is_ti2i and cond_image_infos is not None:
+            all_image_slices = tokenizer_output.all_image_slices
             rope_image_infos = []
             slice_idx = 0
             for info in cond_image_infos:
-                if slice_idx < len(tokenizer_output.all_image_slices):
-                    s = tokenizer_output.all_image_slices[slice_idx]
-                    rope_image_infos.append((s, (info["vae_token_h"], info["vae_token_w"])))
+                if slice_idx < len(all_image_slices):
+                    s = all_image_slices[slice_idx]
+                    rope_image_infos.append(
+                        (s, (info["vae_token_h"], info["vae_token_w"]))
+                    )
                     slice_idx += 1
-            if slice_idx < len(tokenizer_output.all_image_slices):
-                s = tokenizer_output.all_image_slices[slice_idx]
+
+                if slice_idx < len(all_image_slices):
+                    s = all_image_slices[slice_idx]
+                    if (
+                        info.get("vit_token_h", 0) > 0
+                        and info.get("vit_token_w", 0) > 0
+                    ):
+                        rope_image_infos.append(
+                            (s, (info["vit_token_h"], info["vit_token_w"]))
+                        )
+                    slice_idx += 1
+
+            if slice_idx < len(all_image_slices):
+                s = all_image_slices[slice_idx]
                 rope_image_infos.append((s, (token_h, token_w)))
             return [rope_image_infos]
         return [[(s, (token_h, token_w)) for s in tokenizer_output.all_image_slices]]

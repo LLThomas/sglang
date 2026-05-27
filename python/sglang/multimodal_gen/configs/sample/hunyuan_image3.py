@@ -1,6 +1,6 @@
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType, SamplingParams
 
@@ -23,6 +23,7 @@ class HunyuanImage3SamplingParams(SamplingParams):
     ar_temperature: float = 1.0  # AR sampling temperature
     ar_top_p: float = 1.0  # AR top-p
     ar_top_k: int = 1  # AR top-k (1 = greedy)
+    ar_progress_log_interval: int = 16  # 0 disables AR token progress logs
     drop_think: bool = False  # drop think portion from CoT
     image_size: str = "auto"  # "auto" = predict ratio via AR, or "HxW"
     sys_type: str = "dynamic"  # system prompt type: "None", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "dynamic", "custom"
@@ -58,7 +59,11 @@ class HunyuanImage3SamplingParams(SamplingParams):
             "top_k": "ar_top_k",
         }
         for config_key, field_name in field_map.items():
-            if field_name not in explicit_fields and config_key in generation_config:
+            if (
+                field_name not in explicit_fields
+                and config_key in generation_config
+                and generation_config[config_key] is not None
+            ):
                 setattr(self, field_name, generation_config[config_key])
 
         if "sys_type" not in explicit_fields:

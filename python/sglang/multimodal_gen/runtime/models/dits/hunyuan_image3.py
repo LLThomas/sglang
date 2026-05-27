@@ -11,6 +11,7 @@
 import logging
 import math
 import time
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
@@ -22,11 +23,24 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DiTConfig,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+from sglang.multimodal_gen.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +126,14 @@ def _scatter_tokens_by_index(
     index = index.to(device=hidden_states.device, dtype=torch.long)
     index = index.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1])
     return hidden_states.scatter(dim=1, index=index, src=src)
+
+
+def _maybe_forward_context():
+    try:
+        get_forward_context()
+        return nullcontext()
+    except AssertionError:
+        return set_forward_context(current_timestep=0, attn_metadata=None)
 
 
 # ---------------------------------------------------------------------------
@@ -612,11 +634,6 @@ def timestep_embedding(
     return embedding
 
 
-# ---------------------------------------------------------------------------
-# Model sub-components
-# ---------------------------------------------------------------------------
-
-
 class TimestepEmbedder(nn.Module):
     """Embeds scalar timesteps into vector representations."""
 
@@ -903,7 +920,6 @@ class UNetUp(nn.Module):
 class HunYuanAttention(nn.Module):
     """
     Self-attention for HunyuanImage3 decoder layers.
-    Single-GPU implementation using PyTorch SDPA.
     """
 
     def __init__(
@@ -916,20 +932,45 @@ class HunYuanAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         bias: bool = False,
         layer_idx: int = 0,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.layer_idx = layer_idx
-        self.q_size = num_heads * head_dim
-        self.kv_size = num_kv_heads * head_dim
         self.scaling = head_dim**-0.5
         self.use_qk_norm = use_qk_norm
 
-        self.qkv_proj = nn.Linear(hidden_size, self.q_size + 2 * self.kv_size, bias=bias)
-        self.o_proj = nn.Linear(self.q_size, hidden_size, bias=bias)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=head_dim,
+            total_num_heads=num_heads,
+            total_num_kv_heads=num_kv_heads,
+            bias=bias,
+            prefix=f"layers.{layer_idx}.self_attn.qkv_proj",
+        )
+        self.num_heads = self.qkv_proj.num_heads
+        self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.q_size = self.num_heads * head_dim
+        self.kv_size = self.num_kv_heads * head_dim
+
+        self.o_proj = RowParallelLinear(
+            input_size=num_heads * head_dim,
+            output_size=hidden_size,
+            bias=bias,
+            input_is_parallel=True,
+            prefix=f"layers.{layer_idx}.self_attn.o_proj",
+        )
+        self.attn = USPAttention(
+            num_heads=self.num_heads,
+            head_size=head_dim,
+            num_kv_heads=self.num_kv_heads,
+            softmax_scale=self.scaling,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
+        )
 
         if self.use_qk_norm:
             self.query_layernorm = RMSNorm(head_dim, eps=rms_norm_eps)
@@ -946,18 +987,8 @@ class HunYuanAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
-        qkv = self.qkv_proj(hidden_states)
-        num_kv_groups = self.num_heads // self.num_kv_heads
-        qkv = qkv.reshape(
-            bsz,
-            q_len,
-            self.num_kv_heads,
-            num_kv_groups + 2,
-            self.head_dim,
-        )
-        q, k, v = torch.split(qkv, [num_kv_groups, 1, 1], dim=3)
-
-        # Official checkpoints pack each KV group as [q..., k, v].
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -975,31 +1006,33 @@ class HunYuanAttention(nn.Module):
             q = self.query_layernorm(q)
             k = self.key_layernorm(k)
 
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
+
         if kv_cache is not None:
             k, v = kv_cache.store(k, v, cache_position, cache_end)
             q = q.to(k.dtype)
 
-        # GQA: repeat kv heads
-        if self.num_kv_heads < self.num_heads:
+        if attention_mask is not None and self.num_kv_heads < self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
-        if attention_mask is not None and attention_mask.dtype is not torch.bool:
-            attention_mask = attention_mask.to(device=q.device, dtype=q.dtype)
+        q_backend = q.transpose(1, 2)
+        k_backend = k.transpose(1, 2)
+        v_backend = v.transpose(1, 2)
 
-        # SDPA attention
-        attn_output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attention_mask,
-            scale=self.scaling,
-        )
+        with _maybe_forward_context():
+            attn_output = self.attn(
+                q_backend,
+                k_backend,
+                v_backend,
+                attn_mask=attention_mask,
+            )
 
-        # [B, H, L, D_h] -> [B, L, H*D_h]
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
-        output = self.o_proj(attn_output)
+        # [B, L, H_local, D_h] -> [B, L, H_local*D_h]
+        attn_output = attn_output.contiguous().view(bsz, q_len, -1)
+        output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -1016,16 +1049,29 @@ class HunYuanMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         bias: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
-        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=bias)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size, intermediate_size],
+            bias=bias,
+            gather_output=False,
+            prefix=f"{prefix}.gate_up_proj" if prefix else "gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            bias=bias,
+            input_is_parallel=True,
+            prefix=f"{prefix}.down_proj" if prefix else "down_proj",
+        )
+        self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        up, gate = gate_up.chunk(2, dim=-1)
-        x = up * F.silu(gate)
-        x = self.down_proj(x)
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -1033,6 +1079,10 @@ class HunYuanSparseMoeBlock(nn.Module):
     """
     Simple top-k MoE block for single-GPU.
     When num_experts <= 1, falls back to a regular MLP.
+
+    HunyuanImage3 is sensitive to router precision.  The official model builds
+    the router gate in fp32 and disables autocast around routing; keep the same
+    behavior here so top-k expert choices do not drift under bf16 inference.
     """
 
     def __init__(
@@ -1043,47 +1093,76 @@ class HunYuanSparseMoeBlock(nn.Module):
         top_k: int = 1,
         num_shared_expert: int = 0,
         bias: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.gate = ReplicatedLinear(
+            hidden_size,
+            num_experts,
+            bias=False,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}.gate" if prefix else "gate",
+        )
         self.experts = nn.ModuleList(
-            [HunYuanMLP(hidden_size, intermediate_size, bias=bias) for _ in range(num_experts)]
+            [
+                HunYuanMLP(
+                    hidden_size,
+                    intermediate_size,
+                    bias=bias,
+                    prefix=f"{prefix}.experts.{idx}" if prefix else f"experts.{idx}",
+                )
+                for idx in range(num_experts)
+            ]
         )
         self.shared_mlp = None
         if num_shared_expert > 0:
             self.shared_mlp = HunYuanMLP(
-                hidden_size, intermediate_size * num_shared_expert, bias=bias
+                hidden_size,
+                intermediate_size * num_shared_expert,
+                bias=bias,
+                prefix=f"{prefix}.shared_mlp" if prefix else "shared_mlp",
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+        num_tokens = hidden_states.shape[0]
 
-        router_logits = self.gate(hidden_states)  # [N, num_experts]
-        scores = F.softmax(router_logits, dim=-1)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            router_logits, _ = self.gate(hidden_states.float())  # [N, num_experts]
+            scores = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+            top_k_scores, top_k_indices = scores.topk(self.top_k, dim=-1)
 
-        top_k_scores, top_k_indices = scores.topk(self.top_k, dim=-1)
         if self.top_k > 1:
             top_k_scores = top_k_scores / torch.clamp(
                 top_k_scores.sum(dim=-1, keepdim=True),
-                min=torch.finfo(top_k_scores.dtype).eps,
+                min=1e-8,
             )
 
-        flat_top_k_indices = top_k_indices.reshape(-1)
-        repeated_hidden_states = hidden_states.repeat_interleave(self.top_k, dim=0)
-        expert_outputs = torch.zeros_like(repeated_hidden_states)
+        flat_expert_indices = top_k_indices.reshape(-1)
+        flat_token_indices = torch.arange(
+            num_tokens, device=hidden_states.device, dtype=torch.long
+        ).repeat_interleave(self.top_k)
+        flat_scores = top_k_scores.reshape(-1).to(hidden_states.dtype)
 
+        output = torch.zeros_like(hidden_states)
         for expert_idx, expert in enumerate(self.experts):
-            expert_mask = flat_top_k_indices == expert_idx
-            expert_outputs[expert_mask] = expert(repeated_hidden_states[expert_mask])
+            expert_positions = torch.nonzero(
+                flat_expert_indices == expert_idx, as_tuple=False
+            ).flatten()
+            if expert_positions.numel() == 0:
+                continue
 
-        output = (
-            expert_outputs.view(hidden_states.shape[0], self.top_k, hidden_dim)
-            * top_k_scores.to(expert_outputs.dtype).unsqueeze(-1)
-        ).sum(dim=1)
+            selected_tokens = flat_token_indices.index_select(0, expert_positions)
+            expert_input = hidden_states.index_select(0, selected_tokens)
+            expert_output = expert(expert_input)
+            expert_output = expert_output * flat_scores.index_select(
+                0, expert_positions
+            ).unsqueeze(-1)
+            output.index_add_(0, selected_tokens, expert_output.to(output.dtype))
 
         if self.shared_mlp is not None:
             output = output + self.shared_mlp(hidden_states)
@@ -1113,6 +1192,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         moe_intermediate_size: int | None = None,
         layer_idx: int = 0,
         moe_layer_num_skipped: int = 0,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -1126,6 +1206,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             rms_norm_eps=rms_norm_eps,
             bias=attention_bias,
             layer_idx=layer_idx,
+            supported_attention_backends=supported_attention_backends,
         )
 
         use_moe = num_experts > 1 and layer_idx >= moe_layer_num_skipped
@@ -1137,11 +1218,13 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 num_experts=num_experts,
                 top_k=moe_topk,
                 num_shared_expert=num_shared_expert,
+                prefix=f"layers.{layer_idx}.mlp",
             )
         else:
             self.mlp = HunYuanMLP(
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
+                prefix=f"layers.{layer_idx}.mlp",
             )
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -1225,6 +1308,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.in_channels
+        self._supported_attention_backends = arch._supported_attention_backends
 
         head_dim = arch.attention_head_dim
         num_kv_heads = getattr(arch, "num_key_value_heads", arch.num_attention_heads)
@@ -1261,6 +1345,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                     ),
                     layer_idx=i,
                     moe_layer_num_skipped=getattr(arch, "moe_layer_num_skipped", 0),
+                    supported_attention_backends=self._supported_attention_backends,
                 )
                 for i in range(arch.num_hidden_layers)
             ]
@@ -1591,13 +1676,10 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                     cache_position = torch.arange(
                         seq_len, device=device, dtype=torch.long
                     )
-                if seq_len > attention_mask.shape[-1]:
-                    causal_mask = torch.triu(
-                        torch.full((seq_len, seq_len), float("-inf"), device=device),
-                        diagonal=1,
-                    ).unsqueeze(0).unsqueeze(0)
-                else:
-                    causal_mask = attention_mask[:, :, :seq_len, :seq_len]
+                causal_mask = torch.ones(
+                    seq_len, seq_len, device=device, dtype=torch.bool
+                ).tril(diagonal=0)
+                causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
                 cur_rope_2d = (
                     (rope_2d[0][:, :seq_len], rope_2d[1][:, :seq_len])
                     if rope_2d is not None

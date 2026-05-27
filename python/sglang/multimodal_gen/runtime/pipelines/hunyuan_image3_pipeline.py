@@ -72,6 +72,48 @@ def _apply_hunyuan_image3_npu_overrides(server_args: ServerArgs) -> None:
         server_args.pin_cpu_memory = False
 
 
+def _split_hunyuan_image3_interleaved_qkv(
+    qkv: torch.Tensor,
+    *,
+    num_attention_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Convert HunyuanImage3 checkpoint QKV from grouped layout to fused QKV."""
+    if qkv.dim() == 0:
+        return qkv
+
+    num_kv_groups = num_attention_heads // num_kv_heads
+    expected_size = num_kv_heads * (num_kv_groups + 2) * head_dim
+    if qkv.shape[0] != expected_size:
+        return qkv
+
+    trailing_shape = qkv.shape[1:]
+    qkv = qkv.reshape(
+        num_kv_heads,
+        num_kv_groups + 2,
+        head_dim,
+        *trailing_shape,
+    )
+    q, k, v = torch.split(qkv, [num_kv_groups, 1, 1], dim=1)
+    return torch.cat(
+        (
+            q.reshape(-1, *trailing_shape),
+            k.reshape(-1, *trailing_shape),
+            v.reshape(-1, *trailing_shape),
+        ),
+        dim=0,
+    )
+
+
+def _swap_hunyuan_image3_gate_up(gate_up: torch.Tensor) -> torch.Tensor:
+    """Convert HunyuanImage3 checkpoint [up, gate] layout to [gate, up]."""
+    if gate_up.dim() == 0 or gate_up.shape[0] % 2 != 0:
+        return gate_up
+    up, gate = gate_up.chunk(2, dim=0)
+    return torch.cat((gate, up), dim=0)
+
+
 def _hunyuan_image3_transformer_weight_iterator(
     safetensors_list,
     model,
@@ -84,6 +126,17 @@ def _hunyuan_image3_transformer_weight_iterator(
     for name, tensor in safetensors_weights_iterator(safetensors_list):
         target_name, _, _ = param_names_mapping(name)
         if target_name in valid_target_names:
+            if target_name.endswith(
+                (".self_attn.qkv_proj.weight", ".self_attn.qkv_proj.weight_scale")
+            ):
+                tensor = _split_hunyuan_image3_interleaved_qkv(
+                    tensor,
+                    num_attention_heads=model.num_attention_heads,
+                    num_kv_heads=model.num_kv_heads,
+                    head_dim=model.head_dim,
+                )
+            elif ".gate_and_up_proj." in name and ".gate_up_proj." in target_name:
+                tensor = _swap_hunyuan_image3_gate_up(tensor)
             yield name, tensor
         else:
             skipped += 1

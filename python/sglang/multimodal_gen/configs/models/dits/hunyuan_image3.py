@@ -3,12 +3,20 @@ from dataclasses import dataclass, field
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 @dataclass
 class HunyuanImage3ArchConfig(DiTArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=list)
     _compile_conditions: list = field(default_factory=list)
+    _supported_attention_backends: set[AttentionBackendEnum] = field(
+        default_factory=lambda: {
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.SAGE_ATTN,
+        }
+    )
     param_names_mapping: dict = field(
         default_factory=lambda: {
             # Strip leading "model." prefix used by HF transformers format
