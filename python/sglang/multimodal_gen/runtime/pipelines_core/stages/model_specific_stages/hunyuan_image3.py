@@ -1,8 +1,8 @@
-"""HunyuanImage-3.0 BeforeDenoisingStage and Tokenizer.
+"""HunyuanImage-3.0 before-denoising stage and tokenizer.
 
 This module implements the preprocessing logic for HunyuanImage-3.0, including
 optional AR text generation (CoT / ratio prediction), token sequence construction,
-and all preprocessing steps needed before the standard DenoisingStage.
+and all preprocessing steps needed before denoising.
 
 Architecture (Hybrid style per sglang-diffusion docs):
   AR generation is consolidated into BeforeDenoisingStage as a conditional
@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from diffusers.utils.torch_utils import randn_tensor
 from torch.distributed.fsdp import FSDPModule
 
@@ -50,8 +49,26 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _first_prompt(prompt):
+    return prompt[0] if isinstance(prompt, list) else prompt
+
+
+def _compose_logits_processors(processors):
+    if not processors:
+        return None
+    if len(processors) == 1:
+        return processors[0]
+
+    def composed(logits, input_ids):
+        for processor in processors:
+            logits = processor(logits, input_ids)
+        return logits
+
+    return composed
+
+
 class HunyuanImage3DenoisingStage(DenoisingStage):
-    """Denoising stage with Ascend-safe validation for HunyuanImage3 timesteps."""
+    """Denoising stage with HunyuanImage3 broadcast/device validation."""
 
     _BROADCAST_TENSOR_FIELDS = (
         "prompt_embeds",
@@ -82,23 +99,17 @@ class HunyuanImage3DenoisingStage(DenoisingStage):
         "neg_position_ids",
     )
 
-    @staticmethod
-    def _to_local_device(value: Any, device: torch.device):
+    @classmethod
+    def _to_local_device(cls, value: Any, device: torch.device):
         if isinstance(value, torch.Tensor):
             return value.to(device)
         if isinstance(value, list):
-            return [
-                HunyuanImage3DenoisingStage._to_local_device(item, device)
-                for item in value
-            ]
+            return [cls._to_local_device(item, device) for item in value]
         if isinstance(value, tuple):
-            return tuple(
-                HunyuanImage3DenoisingStage._to_local_device(item, device)
-                for item in value
-            )
+            return tuple(cls._to_local_device(item, device) for item in value)
         if isinstance(value, dict):
             return {
-                key: HunyuanImage3DenoisingStage._to_local_device(item, device)
+                key: cls._to_local_device(item, device)
                 for key, item in value.items()
             }
         return value
@@ -121,10 +132,7 @@ class HunyuanImage3DenoisingStage(DenoisingStage):
                     setattr(scheduler, attr, value.to(device))
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if (
-            server_args.enable_cfg_parallel
-            and not server_args.use_fsdp_inference
-        ):
+        if server_args.enable_cfg_parallel and not server_args.use_fsdp_inference:
             self._ensure_broadcast_tensors_on_local_device(batch)
         return super().forward(batch, server_args)
 
@@ -1349,6 +1357,10 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         return attention_mask.unsqueeze(0).unsqueeze(0)
 
     @staticmethod
+    def _batch_to_device(value: torch.Tensor | None, device: torch.device):
+        return value.unsqueeze(0).to(device) if value is not None else None
+
+    @staticmethod
     def _normalize_bot_task(bot_task):
         bot_task = bot_task or ""
         if bot_task in ("none", "vanilla"):
@@ -1406,6 +1418,107 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             stop_ids = [tw.eos_token_id]
         return [token_id for token_id in stop_ids if token_id is not None]
 
+    def _build_text_generation_inputs(
+        self,
+        input_ids: torch.Tensor,
+        dit_config,
+        device: torch.device,
+        position_ids: torch.Tensor | None = None,
+    ):
+        input_ids = input_ids.to(device)
+        seq_len = input_ids.shape[1]
+        causal_mask = torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=device),
+            diagonal=1,
+        ).unsqueeze(0).unsqueeze(0)
+        n_elem = dit_config.rope_axes_dim[0] + dit_config.rope_axes_dim[1]
+        rope_2d = build_batch_2d_rope(
+            seq_len=seq_len,
+            n_elem=n_elem,
+            image_infos=None,
+            device=device,
+            base=dit_config.rope_theta,
+        )
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+        else:
+            position_ids = position_ids.to(device)
+        return input_ids, causal_mask, rope_2d, position_ids
+
+    def _build_ratio_logits_processor(self, base_size: int):
+        tw = self.tokenizer_wrapper
+        img_size_token_id = tw.special_token_map.get(f"<img_size_{base_size}>", None)
+        ratio_token_ids = tw.get_ratio_token_ids()
+        if img_size_token_id is None or not ratio_token_ids:
+            return None
+        return ConditionalSliceVocabLogitsProcessor(
+            trigger_token_id=img_size_token_id,
+            allowed_token_ids=ratio_token_ids,
+            force_greedy=True,
+        )
+
+    def _build_ar_logits_processor(self, bot_task, template, base_size, need_ratio):
+        processors = []
+        transitions = self._build_stage_transitions(
+            bot_task, template, base_size, need_ratio
+        )
+        if transitions:
+            processors.append(StageTransitionLogitsProcessor(transitions))
+        ratio_processor = self._build_ratio_logits_processor(base_size)
+        if ratio_processor is not None:
+            processors.append(ratio_processor)
+        return _compose_logits_processors(processors)
+
+    def _build_tokenizer_outputs(
+        self,
+        *,
+        prompt,
+        token_h,
+        token_w,
+        cond_image_infos,
+        base_size,
+        ratio_idx,
+        cot_text,
+        system_prompt,
+        template,
+        do_cfg,
+    ):
+        common_kwargs = dict(
+            prompt=prompt,
+            token_h=token_h,
+            token_w=token_w,
+            base_size=base_size,
+            ratio_idx=ratio_idx,
+            cot_text=cot_text,
+            system_prompt=system_prompt,
+            template=template,
+        )
+        if cond_image_infos is not None:
+            cond_output = self.tokenizer_wrapper.build_ti2i_sequence(
+                cond_image_infos=cond_image_infos,
+                uncond_p=0.0,
+                **common_kwargs,
+            )
+            uncond_output = (
+                self.tokenizer_wrapper.build_ti2i_uncond_sequence(
+                    cond_image_infos=cond_image_infos,
+                    **common_kwargs,
+                )
+                if do_cfg
+                else None
+            )
+        else:
+            cond_output = self.tokenizer_wrapper.build_t2i_sequence(
+                uncond_p=0.0,
+                **common_kwargs,
+            )
+            uncond_output = (
+                self.tokenizer_wrapper.build_uncond_sequence(**common_kwargs)
+                if do_cfg
+                else None
+            )
+        return cond_output, uncond_output
+
     # ------------------------------------------------------------------
     # AR generation (conditional sub-step)
     # ------------------------------------------------------------------
@@ -1433,7 +1546,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         need_ratio = self._is_auto_image_size(getattr(batch, "image_size", "auto"))
 
         # 2. Build AR input sequence
-        prompt = batch.prompt if isinstance(batch.prompt, str) else batch.prompt[0]
+        prompt = _first_prompt(batch.prompt)
         ar_input = self.tokenizer_wrapper.build_ar_sequence(
             prompt=prompt,
             system_prompt=system_prompt,
@@ -1442,59 +1555,18 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             base_size=base_size,
         )
 
-        # 3. Build causal attention mask
-        input_ids = ar_input["input_ids"].to(device)
-        seq_len = input_ids.shape[1]
-        causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=device),
-            diagonal=1,
-        ).unsqueeze(0).unsqueeze(0)
-
-        # 4. Build 2D RoPE for text (no image regions, uses 1D positions)
-        n_elem = dit_config.rope_axes_dim[0] + dit_config.rope_axes_dim[1]
-        rope_cos, rope_sin = build_batch_2d_rope(
-            seq_len=seq_len,
-            n_elem=n_elem,
-            image_infos=None,
-            device=device,
-            base=dit_config.rope_theta,
+        # 3. Build text-only generation inputs and logits processors.
+        input_ids, causal_mask, rope_2d, position_ids = self._build_text_generation_inputs(
+            ar_input["input_ids"],
+            dit_config,
+            device,
+            position_ids=ar_input["position_ids"],
         )
-        rope_2d = (rope_cos, rope_sin)
-
-        # 5. Configure stage transitions and logits processors
-        transitions = self._build_stage_transitions(
+        logits_processor = self._build_ar_logits_processor(
             bot_task, template, base_size, need_ratio
         )
-        ratio_token_ids = self.tokenizer_wrapper.get_ratio_token_ids()
-        img_size_token_id = self.tokenizer_wrapper.special_token_map.get(
-            f"<img_size_{base_size}>", None
-        )
 
-        processors = []
-        if transitions:
-            processors.append(StageTransitionLogitsProcessor(transitions))
-        if img_size_token_id is not None and ratio_token_ids:
-            processors.append(
-                ConditionalSliceVocabLogitsProcessor(
-                    trigger_token_id=img_size_token_id,
-                    allowed_token_ids=ratio_token_ids,
-                    force_greedy=True,
-                )
-            )
-
-        def _compose_logits_processors(procs):
-            """Compose multiple logits processors into one."""
-            def composed(logits, input_ids):
-                for p in procs:
-                    logits = p(logits, input_ids)
-                return logits
-            return composed
-
-        logits_processor = processors[0] if len(processors) == 1 else (
-            _compose_logits_processors(processors) if len(processors) > 1 else None
-        )
-
-        # 6. Run AR generation
+        # 4. Run AR generation
         max_new_tokens = getattr(batch, "ar_max_new_tokens", 2048)
         progress_log_interval = getattr(batch, "ar_progress_log_interval", 16)
         if (
@@ -1513,7 +1585,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             input_ids=input_ids,
             attention_mask=causal_mask,
             rope_2d=rope_2d,
-            position_ids=ar_input["position_ids"].to(device),
+            position_ids=position_ids,
             max_new_tokens=max_new_tokens,
             temperature=getattr(batch, "ar_temperature", 1.0),
             top_p=getattr(batch, "ar_top_p", 1.0),
@@ -1559,7 +1631,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         system_prompt = _resolve_system_prompt(batch, "image", sys_type)
 
         # 2. Build minimal AR input with the official img_ratio prefix.
-        prompt = batch.prompt if isinstance(batch.prompt, str) else batch.prompt[0]
+        prompt = _first_prompt(batch.prompt)
         ar_input = tw.build_ar_sequence(
             prompt=prompt,
             system_prompt=system_prompt or "",
@@ -1569,63 +1641,34 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         )
         img_size_token_id = tw.special_token_map.get(f"<img_size_{base_size}>", None)
         if img_size_token_id is None or tw.boi_token_id is None:
-            raise ValueError(f"Missing image ratio prefix token(s) for base_size={base_size}")
+            raise ValueError(
+                f"Missing image ratio prefix token(s) for base_size={base_size}"
+            )
 
         ratio_prefix = []
         if template == "instruct" and tw.answer_token_id is not None:
             ratio_prefix.append(tw.answer_token_id)
         ratio_prefix.extend([tw.boi_token_id, img_size_token_id])
 
-        # 3. Build causal attention mask
         input_ids = ar_input["input_ids"]
         prefix_tensor = torch.tensor([ratio_prefix], dtype=input_ids.dtype)
-        input_ids = torch.cat([input_ids, prefix_tensor], dim=1).to(device)
-        seq_len = input_ids.shape[1]
-        causal_mask = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=device),
-            diagonal=1,
-        ).unsqueeze(0).unsqueeze(0)
-
-        # 4. Build 2D RoPE for text
-        n_elem = dit_config.rope_axes_dim[0] + dit_config.rope_axes_dim[1]
-        rope_cos, rope_sin = build_batch_2d_rope(
-            seq_len=seq_len,
-            n_elem=n_elem,
-            image_infos=None,
-            device=device,
-            base=dit_config.rope_theta,
+        input_ids = torch.cat([input_ids, prefix_tensor], dim=1)
+        input_ids, causal_mask, rope_2d, position_ids = self._build_text_generation_inputs(
+            input_ids,
+            dit_config,
+            device,
         )
-        rope_2d = (rope_cos, rope_sin)
 
-        # 5. Restrict the next token after <img_size_*> to ratio tokens.
+        # 3. Restrict the next token after <img_size_*> to ratio tokens.
         ratio_token_ids = tw.get_ratio_token_ids()
-        processors = []
-        if img_size_token_id is not None and ratio_token_ids:
-            processors.append(
-                ConditionalSliceVocabLogitsProcessor(
-                    trigger_token_id=img_size_token_id,
-                    allowed_token_ids=ratio_token_ids,
-                    force_greedy=True,
-                )
-            )
+        logits_processor = self._build_ratio_logits_processor(base_size)
 
-        def _compose_logits_processors(procs):
-            def composed(logits, input_ids):
-                for p in procs:
-                    logits = p(logits, input_ids)
-                return logits
-            return composed
-
-        logits_processor = processors[0] if len(processors) == 1 else (
-            _compose_logits_processors(processors) if len(processors) > 1 else None
-        )
-
-        # 7. Run AR generation with small max_new_tokens
+        # 4. Run AR generation with small max_new_tokens
         generated_ids = self.transformer.generate_text(
             input_ids=input_ids,
             attention_mask=causal_mask,
             rope_2d=rope_2d,
-            position_ids=torch.arange(seq_len, device=device).unsqueeze(0),
+            position_ids=position_ids,
             max_new_tokens=1,
             temperature=1.0,
             top_p=1.0,
@@ -1636,7 +1679,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             progress_log_interval=getattr(batch, "ar_progress_log_interval", 16),
         )
 
-        # 8. Extract ratio_index from generated tokens
+        # 5. Extract ratio_index from generated tokens
         input_len = input_ids.shape[1]
         gen_tokens = generated_ids[0][input_len:]
         ratio_index = None
@@ -2004,9 +2047,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             self._run_ratio_prediction(batch, server_args)
 
         # 1. Parse inputs from batch
-        prompt = batch.prompt
-        if isinstance(prompt, list):
-            prompt = prompt[0]
+        prompt = _first_prompt(batch.prompt)
         cot_text = getattr(batch, "cot_text", "") or ""
         bot_task = getattr(batch, "bot_task", "") or ""
         sys_type = getattr(batch, "sys_type", "dynamic") or "dynamic"
@@ -2074,64 +2115,27 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
                 cond_image_infos,
             ) = self._process_cond_images(batch, device)
 
-        if is_ti2i and cond_image_infos is not None:
-            cond_output = self.tokenizer_wrapper.build_ti2i_sequence(
-                prompt=prompt,
-                token_h=token_h,
-                token_w=token_w,
-                cond_image_infos=cond_image_infos,
-                base_size=base_size,
-                ratio_idx=ratio_idx,
-                cot_text=cot_text,
-                system_prompt=system_prompt,
-                uncond_p=0.0,
-                template=template,
-            )
-        else:
-            cond_output = self.tokenizer_wrapper.build_t2i_sequence(
-                prompt=prompt,
-                token_h=token_h,
-                token_w=token_w,
-                base_size=base_size,
-                ratio_idx=ratio_idx,
-                cot_text=cot_text,
-                system_prompt=system_prompt,
-                uncond_p=0.0,
-                template=template,
-            )
-
-        # 6. Build unconditional token sequence (CFG) via two-pass encoding
+        # 6. Build conditional/unconditional token sequences.
         do_cfg = guidance_scale > 1.0
-        if do_cfg:
-            if is_ti2i and cond_image_infos is not None:
-                uncond_output = self.tokenizer_wrapper.build_ti2i_uncond_sequence(
-                    prompt=prompt,
-                    token_h=token_h,
-                    token_w=token_w,
-                    cond_image_infos=cond_image_infos,
-                    base_size=base_size,
-                    ratio_idx=ratio_idx,
-                    cot_text=cot_text,
-                    system_prompt=system_prompt,
-                    template=template,
-                )
-            else:
-                uncond_output = self.tokenizer_wrapper.build_uncond_sequence(
-                    prompt=prompt,
-                    token_h=token_h,
-                    token_w=token_w,
-                    base_size=base_size,
-                    ratio_idx=ratio_idx,
-                    cot_text=cot_text,
-                    system_prompt=system_prompt,
-                    template=template,
-                )
+        cond_output, uncond_output = self._build_tokenizer_outputs(
+            prompt=prompt,
+            token_h=token_h,
+            token_w=token_w,
+            cond_image_infos=cond_image_infos if is_ti2i else None,
+            base_size=base_size,
+            ratio_idx=ratio_idx,
+            cot_text=cot_text,
+            system_prompt=system_prompt,
+            template=template,
+            do_cfg=do_cfg,
+        )
 
         # 7. Get token embeddings via transformer.embed_tokens
         cond_tokens = cond_output.tokens.unsqueeze(0).to(device)  # [1, seq_len]
         cond_embeds = self._embed_tokens(cond_tokens)  # [1, seq_len, hidden_size]
 
         if do_cfg:
+            assert uncond_output is not None
             uncond_tokens = uncond_output.tokens.unsqueeze(0).to(device)
             uncond_embeds = self._embed_tokens(uncond_tokens)
 
@@ -2186,65 +2190,43 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             )
 
         # 11. Prepare image masks and scatter indices
-        image_mask = cond_output.image_mask.unsqueeze(0).to(device)  # [1, seq_len]
-        image_scatter_index = (
-            cond_output.image_scatter_index.unsqueeze(0).to(device)
-            if cond_output.image_scatter_index is not None
-            else None
+        image_mask = self._batch_to_device(cond_output.image_mask, device)
+        image_scatter_index = self._batch_to_device(
+            cond_output.image_scatter_index, device
         )
         if do_cfg:
-            neg_image_mask = uncond_output.image_mask.unsqueeze(0).to(device)
-            neg_image_scatter_index = (
-                uncond_output.image_scatter_index.unsqueeze(0).to(device)
-                if uncond_output.image_scatter_index is not None
-                else None
+            neg_image_mask = self._batch_to_device(uncond_output.image_mask, device)
+            neg_image_scatter_index = self._batch_to_device(
+                uncond_output.image_scatter_index, device
             )
-        timestep_scatter_index = (
-            cond_output.timestep_scatter_index.unsqueeze(0).to(device)
-            if cond_output.timestep_scatter_index is not None
-            else None
+        timestep_scatter_index = self._batch_to_device(
+            cond_output.timestep_scatter_index, device
         )
         if do_cfg:
-            neg_timestep_scatter_index = (
-                uncond_output.timestep_scatter_index.unsqueeze(0).to(device)
-                if uncond_output.timestep_scatter_index is not None
-                else None
+            neg_timestep_scatter_index = self._batch_to_device(
+                uncond_output.timestep_scatter_index, device
             )
-        gen_timestep_scatter_index = (
-            cond_output.gen_timestep_scatter_index.unsqueeze(0).to(device)
-            if cond_output.gen_timestep_scatter_index is not None
-            else None
+        gen_timestep_scatter_index = self._batch_to_device(
+            cond_output.gen_timestep_scatter_index, device
         )
         if do_cfg:
-            neg_gen_timestep_scatter_index = (
-                uncond_output.gen_timestep_scatter_index.unsqueeze(0).to(device)
-                if uncond_output.gen_timestep_scatter_index is not None
-                else None
+            neg_gen_timestep_scatter_index = self._batch_to_device(
+                uncond_output.gen_timestep_scatter_index, device
             )
-        cond_timestep_scatter_index = (
-            cond_output.cond_timestep_scatter_index.unsqueeze(0).to(device)
-            if cond_output.cond_timestep_scatter_index is not None
-            else None
+        cond_timestep_scatter_index = self._batch_to_device(
+            cond_output.cond_timestep_scatter_index, device
         )
-        cond_vae_image_mask = (
-            cond_output.cond_vae_image_mask.unsqueeze(0).to(device)
-            if cond_output.cond_vae_image_mask is not None
-            else None
+        cond_vae_image_mask = self._batch_to_device(
+            cond_output.cond_vae_image_mask, device
         )
-        cond_vae_scatter_index = (
-            cond_output.cond_vae_scatter_index.unsqueeze(0).to(device)
-            if cond_output.cond_vae_scatter_index is not None
-            else None
+        cond_vae_scatter_index = self._batch_to_device(
+            cond_output.cond_vae_scatter_index, device
         )
-        cond_vit_image_mask = (
-            cond_output.cond_vit_image_mask.unsqueeze(0).to(device)
-            if cond_output.cond_vit_image_mask is not None
-            else None
+        cond_vit_image_mask = self._batch_to_device(
+            cond_output.cond_vit_image_mask, device
         )
-        cond_vit_scatter_index = (
-            cond_output.cond_vit_scatter_index.unsqueeze(0).to(device)
-            if cond_output.cond_vit_scatter_index is not None
-            else None
+        cond_vit_scatter_index = self._batch_to_device(
+            cond_output.cond_vit_scatter_index, device
         )
 
         # 12. Prepare initial noise latents

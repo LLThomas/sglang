@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """HunyuanImage-3.0 Pipeline for sglang-diffusion.
 
-HunyuanImage-3.0 uses a non-standard Diffusers format (transformers auto_map
-with config.json instead of model_index.json).  All weights live in the repo
-root as sharded safetensors; there are no sub-directories for transformer/vae.
-
-This pipeline therefore overrides ``_load_config()`` and ``load_modules()`` to
-handle the custom layout, similar to ``Hunyuan3D2Pipeline``.
+HunyuanImage-3.0 uses a non-standard Diffusers format: config and all
+component weights live at the repo root.  The pipeline therefore loads the
+flat checkpoint directly instead of using Diffusers component subdirectories.
 """
 
 import glob
@@ -28,6 +25,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    default_weight_loader,
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_hunyuanimage3 import (
@@ -52,68 +50,6 @@ from sglang.multimodal_gen.utils import set_mixed_precision_policy
 logger = init_logger(__name__)
 
 
-def _apply_hunyuan_image3_npu_overrides(server_args: ServerArgs) -> None:
-    if (
-        current_platform.is_npu()
-        and (
-            (
-                server_args.use_fsdp_inference
-                and server_args.dit_cpu_offload
-            )
-            or server_args.is_dit_layerwise_offload_selected
-        )
-        and server_args.pin_cpu_memory
-    ):
-        logger.warning(
-            "Disabling pin_cpu_memory for HunyuanImage3 DiT offload on NPU. "
-            "Pinned H2D parameter copies can trigger Ascend vector core exceptions "
-            "during repeated layer transfers."
-        )
-        server_args.pin_cpu_memory = False
-
-
-def _split_hunyuan_image3_interleaved_qkv(
-    qkv: torch.Tensor,
-    *,
-    num_attention_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-) -> torch.Tensor:
-    """Convert HunyuanImage3 checkpoint QKV from grouped layout to fused QKV."""
-    if qkv.dim() == 0:
-        return qkv
-
-    num_kv_groups = num_attention_heads // num_kv_heads
-    expected_size = num_kv_heads * (num_kv_groups + 2) * head_dim
-    if qkv.shape[0] != expected_size:
-        return qkv
-
-    trailing_shape = qkv.shape[1:]
-    qkv = qkv.reshape(
-        num_kv_heads,
-        num_kv_groups + 2,
-        head_dim,
-        *trailing_shape,
-    )
-    q, k, v = torch.split(qkv, [num_kv_groups, 1, 1], dim=1)
-    return torch.cat(
-        (
-            q.reshape(-1, *trailing_shape),
-            k.reshape(-1, *trailing_shape),
-            v.reshape(-1, *trailing_shape),
-        ),
-        dim=0,
-    )
-
-
-def _swap_hunyuan_image3_gate_up(gate_up: torch.Tensor) -> torch.Tensor:
-    """Convert HunyuanImage3 checkpoint [up, gate] layout to [gate, up]."""
-    if gate_up.dim() == 0 or gate_up.shape[0] % 2 != 0:
-        return gate_up
-    up, gate = gate_up.chunk(2, dim=0)
-    return torch.cat((gate, up), dim=0)
-
-
 def _hunyuan_image3_transformer_weight_iterator(
     safetensors_list,
     model,
@@ -121,22 +57,18 @@ def _hunyuan_image3_transformer_weight_iterator(
 ):
     """Yield only flat-checkpoint weights that belong to the DiT transformer."""
     valid_target_names = set(model.state_dict().keys())
+    weight_converter = getattr(model, "convert_checkpoint_weight_for_loading", None)
     skipped = 0
 
     for name, tensor in safetensors_weights_iterator(safetensors_list):
         target_name, _, _ = param_names_mapping(name)
         if target_name in valid_target_names:
-            if target_name.endswith(
-                (".self_attn.qkv_proj.weight", ".self_attn.qkv_proj.weight_scale")
-            ):
-                tensor = _split_hunyuan_image3_interleaved_qkv(
-                    tensor,
-                    num_attention_heads=model.num_attention_heads,
-                    num_kv_heads=model.num_kv_heads,
-                    head_dim=model.head_dim,
+            if weight_converter is not None:
+                tensor = weight_converter(
+                    source_name=name,
+                    target_name=target_name,
+                    tensor=tensor,
                 )
-            elif ".gate_and_up_proj." in name and ".gate_up_proj." in target_name:
-                tensor = _swap_hunyuan_image3_gate_up(tensor)
             yield name, tensor
         else:
             skipped += 1
@@ -234,6 +166,120 @@ def _load_hunyuan_image3_transformer(
     return model
 
 
+def _resolve_hunyuan_image3_model_path(model_path: str) -> str:
+    if os.path.isdir(model_path) and os.path.isfile(
+        os.path.join(model_path, "config.json")
+    ):
+        return model_path
+
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        maybe_download_model,
+    )
+
+    return maybe_download_model(model_path)
+
+
+def _load_prefixed_parameters(
+    module: torch.nn.Module,
+    safetensors_files: list[str],
+    prefix: str,
+) -> int:
+    if hasattr(module, "load_weights"):
+        stripped_weights = (
+            (name[len(prefix) :], tensor)
+            for name, tensor in safetensors_weights_iterator(safetensors_files)
+            if name.startswith(prefix)
+        )
+        loaded = module.load_weights(stripped_weights)
+        return len(loaded)
+
+    params = dict(module.named_parameters())
+    loaded: set[str] = set()
+
+    for name, tensor in safetensors_weights_iterator(safetensors_files):
+        if not name.startswith(prefix):
+            continue
+        target_name = name[len(prefix) :]
+        if target_name in params:
+            default_weight_loader(params[target_name], tensor)
+            loaded.add(target_name)
+
+    missing = len(params) - len(loaded)
+    if missing:
+        logger.warning(
+            "Loaded %d/%d parameter(s) for prefix %s; %d missing",
+            len(loaded),
+            len(params),
+            prefix,
+            missing,
+        )
+    return len(loaded)
+
+
+def _load_hunyuan_image3_vae(
+    pipeline_config,
+    safetensors_files: list[str],
+    device: torch.device,
+    local_model_path: str,
+) -> torch.nn.Module:
+    from sglang.multimodal_gen.configs.models.vaes.hunyuan_image3 import (
+        HunyuanImage3VAEConfig,
+    )
+
+    vae_config = pipeline_config.vae_config
+    if not isinstance(vae_config, HunyuanImage3VAEConfig):
+        vae_config = HunyuanImage3VAEConfig()
+
+    vae = AutoencoderKLConv3D(vae_config).to(device=device, dtype=torch.float32)
+    loaded = _load_prefixed_parameters(vae, safetensors_files, "vae.")
+    logger.info("Loaded %d VAE parameter(s) from %s", loaded, local_model_path)
+    return vae
+
+
+def _load_hunyuan_image3_image_encoder(
+    hf_config: dict[str, Any],
+    safetensors_files: list[str],
+    device: torch.device,
+) -> dict[str, Any] | None:
+    from sglang.multimodal_gen.runtime.models.encoders.siglip2 import (
+        LightProjector,
+        Siglip2VisionTransformer,
+    )
+
+    vit_config = hf_config.get("vit", None)
+    if vit_config is None:
+        return None
+
+    vision_model = Siglip2VisionTransformer(vit_config).to(
+        device=device, dtype=torch.bfloat16
+    )
+    vision_aligner = None
+    vit_aligner_config = hf_config.get("vit_aligner", None)
+    if vit_aligner_config is not None:
+        vision_aligner = LightProjector(vit_aligner_config).to(
+            device=device, dtype=torch.bfloat16
+        )
+
+    loaded_vision = _load_prefixed_parameters(
+        vision_model, safetensors_files, "vision_model."
+    )
+    loaded_aligner = (
+        _load_prefixed_parameters(vision_aligner, safetensors_files, "vision_aligner.")
+        if vision_aligner is not None
+        else 0
+    )
+    logger.info(
+        "Loaded %d vision_model and %d vision_aligner parameter(s)",
+        loaded_vision,
+        loaded_aligner,
+    )
+    return {
+        "vision_model": vision_model,
+        "vision_aligner": vision_aligner,
+        "vit_processor_config": hf_config.get("vit_processor", None),
+    }
+
+
 class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "HunyuanImage3ForCausalMM"
 
@@ -244,246 +290,80 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     ]
 
-    # ------------------------------------------------------------------
-    # Custom model layout: no model_index.json
-    # ------------------------------------------------------------------
-
-    def _load_config(self) -> dict[str, Any]:
-        """Return a synthetic model_index for the non-Diffusers repo layout.
-
-        HunyuanImage-3.0 ships a ``config.json`` (transformers format) instead
-        of ``model_index.json``.  We synthesize the index so that
-        ``ComposedPipelineBase.load_modules()`` can dispatch to the correct
-        component loaders.
-        """
-        return {
-            "_class_name": self.pipeline_name,
-            "_diffusers_version": "0.0.0",
-            "tokenizer": ["transformers", "AutoTokenizer"],
-            "transformer": ["diffusers", "HunyuanImage3DiT"],
-            "vae": ["diffusers", "AutoencoderKLConv3D"],
-            "scheduler": [
-                "diffusers",
-                "FlowMatchEulerDiscreteScheduler",
-            ],
-        }
-
     def load_modules(
         self,
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, Any]:
-        """Load all components for the HunyuanImage-3.0 model.
-
-        Because the model uses a non-standard layout (no sub-directories), we
-        handle each component manually instead of relying on the default
-        ``ComposedPipelineBase.load_modules()`` which expects Diffusers
-        sub-directories.
-        """
-        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-            maybe_download_model,
+        """Load HunyuanImage-3.0 components from the flat checkpoint layout."""
+        from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+            resolve_transformer_safetensors_to_load,
         )
+        from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            get_diffusers_component_config,
+        )
+        from transformers import AutoTokenizer
 
-        model_path = server_args.model_path
+        local_model_path = _resolve_hunyuan_image3_model_path(server_args.model_path)
+        hf_config = get_diffusers_component_config(local_model_path)
+        safetensors_files = sorted(
+            glob.glob(os.path.join(local_model_path, "*.safetensors"))
+        )
         device = get_local_torch_device()
-        _apply_hunyuan_image3_npu_overrides(server_args)
-
-        # Download the full model if not already local
-        if not os.path.isdir(model_path) or not os.path.isfile(
-            os.path.join(model_path, "config.json")
-        ):
-            local_model_path = maybe_download_model(model_path)
-        else:
-            local_model_path = model_path
 
         components: dict[str, Any] = {}
 
-        # --- Tokenizer ---
         if loaded_modules and "tokenizer" in loaded_modules:
             components["tokenizer"] = loaded_modules["tokenizer"]
         else:
-            from transformers import AutoTokenizer
+            components["tokenizer"] = AutoTokenizer.from_pretrained(local_model_path)
 
-            components["tokenizer"] = AutoTokenizer.from_pretrained(
-                local_model_path,
-            )
-
-        # --- Transformer (DiT) ---
         if loaded_modules and "transformer" in loaded_modules:
             components["transformer"] = loaded_modules["transformer"]
         else:
-            from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
-                resolve_transformer_safetensors_to_load,
-            )
-            from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
-            from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-                get_diffusers_component_config,
-            )
-
-            # Read HF config and inject _class_name for ModelRegistry
-            config = get_diffusers_component_config(local_model_path)
-            if "_class_name" not in config:
-                config["_class_name"] = "HunyuanImage3DiT"
-
-            # Update dit_config from HF config before instantiation
+            transformer_config = dict(hf_config)
+            transformer_config.setdefault("_class_name", "HunyuanImage3DiT")
             dit_config = server_args.pipeline_config.dit_config
-            dit_config.update_model_arch(config)
+            dit_config.update_model_arch(transformer_config)
 
-            # Resolve model class
-            cls_name = config.pop("_class_name")
+            cls_name = transformer_config.pop("_class_name")
             model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
-
-            # Find safetensors files
             safetensors_list = resolve_transformer_safetensors_to_load(
                 server_args, local_model_path
             )
-
-            model = _load_hunyuan_image3_transformer(
+            components["transformer"] = _load_hunyuan_image3_transformer(
                 model_cls=model_cls,
-                init_params={"config": dit_config, "hf_config": config},
+                init_params={"config": dit_config, "hf_config": transformer_config},
                 safetensors_list=safetensors_list,
                 device=device,
                 server_args=server_args,
             )
-            components["transformer"] = model
             server_args.model_loaded["transformer"] = True
 
-        # --- VAE ---
         if loaded_modules and "vae" in loaded_modules:
             components["vae"] = loaded_modules["vae"]
         else:
-            from sglang.multimodal_gen.configs.models.vaes.hunyuan_image3 import (
-                HunyuanImage3VAEConfig,
+            components["vae"] = _load_hunyuan_image3_vae(
+                server_args.pipeline_config,
+                safetensors_files,
+                device,
+                local_model_path,
             )
-            from sglang.multimodal_gen.runtime.loader.weight_utils import (
-                default_weight_loader,
-                safetensors_weights_iterator,
-            )
-
-            vae_config = server_args.pipeline_config.vae_config
-            if not isinstance(vae_config, HunyuanImage3VAEConfig):
-                vae_config = HunyuanImage3VAEConfig()
-
-            vae = AutoencoderKLConv3D(vae_config)
-
-            # Load VAE weights from the shared safetensors files.
-            # HunyuanImage-3.0 stores all weights (transformer + vae + ...)
-            # in the same sharded safetensors at the repo root, with "vae."
-            # prefix for VAE parameters.
-            safetensors_files = sorted(
-                glob.glob(os.path.join(local_model_path, "*.safetensors"))
-            )
-            if safetensors_files:
-                vae = vae.to(device=device, dtype=torch.float32)
-                params_dict = dict(vae.named_parameters())
-                loaded_params: set[str] = set()
-
-                for name, tensor in safetensors_weights_iterator(safetensors_files):
-                    # Only load VAE weights (prefixed with "vae.")
-                    if not name.startswith("vae."):
-                        continue
-                    # Strip "vae." prefix
-                    name = name[4:]
-                    if name in params_dict:
-                        default_weight_loader(params_dict[name], tensor)
-                        loaded_params.add(name)
-
-                logger.info(
-                    "Loaded %d/%d VAE parameters from %s",
-                    len(loaded_params),
-                    len(params_dict),
-                    local_model_path,
-                )
-
-            components["vae"] = vae
             server_args.model_loaded["vae"] = True
 
-        # --- Scheduler ---
-        flow_shift = getattr(
-            server_args.pipeline_config, "flow_shift", 3.0
-        )
+        flow_shift = getattr(server_args.pipeline_config, "flow_shift", 3.0)
         components["scheduler"] = FlowMatchEulerDiscreteScheduler(
             shift=flow_shift,
         )
 
-        # --- Image Encoder (SigLIP2 + LightProjector) for TI2I ---
-        # Only load if the pipeline config requires image input (TI2I mode)
         task_type = getattr(server_args.pipeline_config, "task_type", None)
         if task_type is not None and task_type.accepts_image_input():
-            from sglang.multimodal_gen.runtime.loader.weight_utils import (
-                default_weight_loader,
-                safetensors_weights_iterator,
+            components["image_encoder"] = _load_hunyuan_image3_image_encoder(
+                hf_config,
+                safetensors_files,
+                device,
             )
-            from sglang.multimodal_gen.runtime.models.encoders.siglip2 import (
-                LightProjector,
-                Siglip2VisionTransformer,
-            )
-
-            # Read HF config for vit and vit_aligner configs
-            from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-                get_diffusers_component_config,
-            )
-
-            hf_config = get_diffusers_component_config(local_model_path)
-
-            # Load SigLIP2 vision model
-            vit_config = hf_config.get("vit", None)
-            vit_aligner_config = hf_config.get("vit_aligner", None)
-
-            image_encoder = None
-            if vit_config is not None:
-                vision_model = Siglip2VisionTransformer(vit_config)
-                vision_aligner = None
-                if vit_aligner_config is not None:
-                    vision_aligner = LightProjector(vit_aligner_config)
-
-                # Load weights from shared safetensors
-                safetensors_files = sorted(
-                    glob.glob(os.path.join(local_model_path, "*.safetensors"))
-                )
-                if safetensors_files:
-                    vision_model = vision_model.to(device=device, dtype=torch.bfloat16)
-                    if vision_aligner is not None:
-                        vision_aligner = vision_aligner.to(
-                            device=device, dtype=torch.bfloat16
-                        )
-
-                    vm_params = dict(vision_model.named_parameters())
-                    va_params = (
-                        dict(vision_aligner.named_parameters())
-                        if vision_aligner is not None
-                        else {}
-                    )
-                    loaded_vm: set[str] = set()
-                    loaded_va: set[str] = set()
-
-                    for name, tensor in safetensors_weights_iterator(safetensors_files):
-                        if name.startswith("vision_model."):
-                            stripped = name[len("vision_model."):]
-                            if stripped in vm_params:
-                                default_weight_loader(vm_params[stripped], tensor)
-                                loaded_vm.add(stripped)
-                        elif name.startswith("vision_aligner."):
-                            stripped = name[len("vision_aligner."):]
-                            if stripped in va_params:
-                                default_weight_loader(va_params[stripped], tensor)
-                                loaded_va.add(stripped)
-
-                    logger.info(
-                        "Loaded %d/%d vision_model, %d/%d vision_aligner parameters",
-                        len(loaded_vm),
-                        len(vm_params),
-                        len(loaded_va),
-                        len(va_params),
-                    )
-
-                image_encoder = {
-                    "vision_model": vision_model,
-                    "vision_aligner": vision_aligner,
-                    "vit_processor_config": hf_config.get("vit_processor", None),
-                }
-
-            components["image_encoder"] = image_encoder
 
         logger.info(
             "HunyuanImage3Pipeline loaded all components from %s",

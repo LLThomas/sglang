@@ -19,7 +19,9 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
     consolidated into BeforeDenoisingStage, not via a pipeline-level flag.
     """
 
-    task_type: ModelTaskType = ModelTaskType.T2I
+    # HunyuanImage-3.0 supports both text-only and text+image generation.  In
+    # sglang, TI2I means image input is accepted but not required.
+    task_type: ModelTaskType = ModelTaskType.TI2I
     vae_precision: str = "fp16"
     should_use_guidance: bool = True
     vae_tiling: bool = False
@@ -136,14 +138,3 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
             frames = frames.squeeze(2)  # (B, C, 1, H, W) -> (B, C, H, W)
         return frames
 
-
-@dataclass
-class HunyuanImage3TI2IPipelineConfig(HunyuanImage3PipelineConfig):
-    """Pipeline config for HunyuanImage-3.0 TI2I (Text & Image to Image).
-
-    Same as T2I config but with TI2I task type so ``image_path`` is
-    accepted by SamplingParams validation.  The TI2I mode enables
-    conditional image input (cond VAE + ViT embeddings).
-    """
-
-    task_type: ModelTaskType = ModelTaskType.TI2I

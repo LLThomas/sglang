@@ -1286,6 +1286,59 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
     reverse_param_names_mapping = HunyuanImage3DiTConfig().arch_config.reverse_param_names_mapping
     lora_param_names_mapping = HunyuanImage3DiTConfig().arch_config.lora_param_names_mapping
 
+    _qkv_checkpoint_suffixes = (
+        ".self_attn.qkv_proj.weight",
+        ".self_attn.qkv_proj.weight_scale",
+    )
+
+    def _split_checkpoint_qkv_weight(self, qkv: torch.Tensor) -> torch.Tensor:
+        """Convert HunyuanImage3 grouped QKV checkpoint layout to packed QKV."""
+        if qkv.dim() == 0:
+            return qkv
+
+        num_kv_groups = self.num_attention_heads // self.num_kv_heads
+        expected_size = self.num_kv_heads * (num_kv_groups + 2) * self.head_dim
+        if qkv.shape[0] != expected_size:
+            return qkv
+
+        trailing_shape = qkv.shape[1:]
+        qkv = qkv.reshape(
+            self.num_kv_heads,
+            num_kv_groups + 2,
+            self.head_dim,
+            *trailing_shape,
+        )
+        q, k, v = torch.split(qkv, [num_kv_groups, 1, 1], dim=1)
+        return torch.cat(
+            (
+                q.reshape(-1, *trailing_shape),
+                k.reshape(-1, *trailing_shape),
+                v.reshape(-1, *trailing_shape),
+            ),
+            dim=0,
+        )
+
+    @staticmethod
+    def _swap_checkpoint_gate_up(gate_up: torch.Tensor) -> torch.Tensor:
+        """Convert checkpoint [up, gate] layout to SiluAndMul [gate, up]."""
+        if gate_up.dim() == 0 or gate_up.shape[0] % 2 != 0:
+            return gate_up
+        up, gate = gate_up.chunk(2, dim=0)
+        return torch.cat((gate, up), dim=0)
+
+    def convert_checkpoint_weight_for_loading(
+        self,
+        *,
+        source_name: str,
+        target_name: str,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if target_name.endswith(self._qkv_checkpoint_suffixes):
+            return self._split_checkpoint_qkv_weight(tensor)
+        if ".gate_and_up_proj." in source_name and ".gate_up_proj." in target_name:
+            return self._swap_checkpoint_gate_up(tensor)
+        return tensor
+
     def __init__(
         self,
         config: HunyuanImage3DiTConfig,
