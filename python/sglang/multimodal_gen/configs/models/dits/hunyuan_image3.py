@@ -43,14 +43,14 @@ class HunyuanImage3ArchConfig(DiTArchConfig):
     num_hidden_layers: int = 32
     num_attention_heads: int = 32
     attention_head_dim: int = 128
-    intermediate_size: int = 11008
+    intermediate_size: int = 3072
     patch_size: int = 1
     in_channels: int = 32  # VAE latent_channels from config.json
     out_channels: int = 32
     vocab_size: int = 133120
     image_base_size: int = 1024
     vae_downsample_factor: tuple[int, int] = (16, 16)
-    rope_theta: float = 256.0
+    rope_theta: float = 10000.0
     rope_axes_dim: tuple[int, int] = (64, 64)
     qk_norm: str = "rms_norm"
     guidance_embeds: bool = False
@@ -61,11 +61,13 @@ class HunyuanImage3ArchConfig(DiTArchConfig):
     attention_bias: bool = False
     # MoE params (per-layer lists from config.json)
     num_experts: int = 64
-    moe_topk: int = 8
-    num_shared_expert: int = 1
+    moe_topk: int | list[int] = field(default_factory=lambda: [8] * 32)
+    num_shared_expert: int | list[int] = field(default_factory=lambda: [1] * 32)
     moe_layer_num_skipped: int = 0
     use_mixed_mlp_moe: bool = True
-    moe_intermediate_size: int = 11008
+    moe_intermediate_size: int | list[int] = field(
+        default_factory=lambda: [3072] * 32
+    )
     # patch_embed / final_layer
     patch_embed_hidden_dim: int = 1024
     # Timestep embedders

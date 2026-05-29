@@ -49,6 +49,62 @@ from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
+HUNYUAN_IMAGE3_TRANSFORMER_CLASS = "HunyuanImage3DiT"
+HUNYUAN_IMAGE3_TRANSFORMER_DTYPE = torch.bfloat16
+HUNYUAN_IMAGE3_TRANSFORMER_REDUCE_DTYPE = torch.float32
+
+
+def _maybe_shard_hunyuan_image3_transformer(
+    model: torch.nn.Module,
+    server_args: ServerArgs,
+    mp_policy: MixedPrecisionPolicy,
+) -> None:
+    if not server_args.use_fsdp_inference:
+        return
+    if current_platform.is_mps():
+        logger.info("Disabling FSDP for MPS platform as it's not compatible")
+        return
+
+    model._pre_fsdp_weight_loader_params = {
+        n: p
+        for n, p in model.named_parameters()
+        if getattr(p, "weight_loader", None)
+    }
+    device_mesh = init_device_mesh(
+        current_platform.device_type,
+        mesh_shape=(server_args.hsdp_replicate_dim, server_args.hsdp_shard_dim),
+        mesh_dim_names=("replicate", "shard"),
+    )
+    shard_model(
+        model,
+        cpu_offload=server_args.dit_cpu_offload,
+        reshard_after_forward=True,
+        mp_policy=mp_policy,
+        mesh=device_mesh,
+        fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
+        pin_cpu_memory=server_args.pin_cpu_memory,
+    )
+
+
+def _resolve_hunyuan_image3_checkpoint(model_path: str) -> str:
+    if os.path.isdir(model_path) and os.path.isfile(
+        os.path.join(model_path, "config.json")
+    ):
+        return model_path
+
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        maybe_download_model,
+    )
+
+    return maybe_download_model(model_path)
+
+
+def _list_hunyuan_image3_safetensors(model_path: str, component_name: str) -> list[str]:
+    safetensors_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not safetensors_files:
+        raise ValueError(f"No {component_name} safetensors files found in {model_path}")
+    return safetensors_files
+
 
 def _hunyuan_image3_transformer_weight_iterator(
     safetensors_list,
@@ -83,7 +139,8 @@ def _hunyuan_image3_transformer_weight_iterator(
 def _load_hunyuan_image3_transformer(
     *,
     model_cls,
-    init_params: dict[str, Any],
+    dit_config,
+    hf_config: dict[str, Any],
     safetensors_list: list[str],
     device: torch.device,
     server_args: ServerArgs,
@@ -94,44 +151,24 @@ def _load_hunyuan_image3_transformer(
     tensors. Filtering here keeps the generic FSDP loader strict while allowing
     this model-specific flat layout.
     """
-    param_dtype = torch.bfloat16
-    reduce_dtype = torch.float32
+    param_dtype = HUNYUAN_IMAGE3_TRANSFORMER_DTYPE
     mp_policy = MixedPrecisionPolicy(
         param_dtype,
-        reduce_dtype,
+        HUNYUAN_IMAGE3_TRANSFORMER_REDUCE_DTYPE,
         None,
         cast_forward_inputs=False,
     )
     set_mixed_precision_policy(
         param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
+        reduce_dtype=HUNYUAN_IMAGE3_TRANSFORMER_REDUCE_DTYPE,
         output_dtype=None,
         mp_policy=mp_policy,
     )
 
     with set_default_torch_dtype(param_dtype), torch.device("meta"):
-        model = model_cls(**init_params)
+        model = model_cls(config=dit_config, hf_config=hf_config)
 
-    if server_args.use_fsdp_inference and not current_platform.is_mps():
-        model._pre_fsdp_weight_loader_params = {
-            n: p
-            for n, p in model.named_parameters()
-            if getattr(p, "weight_loader", None)
-        }
-        device_mesh = init_device_mesh(
-            current_platform.device_type,
-            mesh_shape=(server_args.hsdp_replicate_dim, server_args.hsdp_shard_dim),
-            mesh_dim_names=("replicate", "shard"),
-        )
-        shard_model(
-            model,
-            cpu_offload=server_args.dit_cpu_offload,
-            reshard_after_forward=True,
-            mp_policy=mp_policy,
-            mesh=device_mesh,
-            fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
-            pin_cpu_memory=server_args.pin_cpu_memory,
-        )
+    _maybe_shard_hunyuan_image3_transformer(model, server_args, mp_policy)
 
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     weight_iterator = _hunyuan_image3_transformer_weight_iterator(
@@ -163,20 +200,43 @@ def _load_hunyuan_image3_transformer(
     for name, param in chain(model.named_parameters(), model.named_buffers()):
         if param.is_meta:
             raise RuntimeError(f"Unexpected param or buffer {name} on meta device.")
-    return model
+        if isinstance(param, torch.nn.Parameter):
+            param.requires_grad = False
+    return model.eval()
 
 
-def _resolve_hunyuan_image3_model_path(model_path: str) -> str:
-    if os.path.isdir(model_path) and os.path.isfile(
-        os.path.join(model_path, "config.json")
-    ):
-        return model_path
-
-    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-        maybe_download_model,
+def _load_hunyuan_image3_transformer_component(
+    server_args: ServerArgs,
+    hf_config: dict[str, Any],
+    local_model_path: str,
+    device: torch.device,
+) -> torch.nn.Module:
+    from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+        resolve_transformer_safetensors_to_load,
     )
+    from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 
-    return maybe_download_model(model_path)
+    transformer_config = dict(hf_config)
+    cls_name = transformer_config.pop(
+        "_class_name", HUNYUAN_IMAGE3_TRANSFORMER_CLASS
+    )
+    dit_config = server_args.pipeline_config.dit_config
+    dit_config.update_model_arch(transformer_config)
+
+    model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
+    safetensors_list = resolve_transformer_safetensors_to_load(
+        server_args, local_model_path
+    )
+    if not safetensors_list:
+        raise ValueError(f"No transformer safetensors files found in {local_model_path}")
+    return _load_hunyuan_image3_transformer(
+        model_cls=model_cls,
+        dit_config=dit_config,
+        hf_config=transformer_config,
+        safetensors_list=safetensors_list,
+        device=device,
+        server_args=server_args,
+    )
 
 
 def _load_prefixed_parameters(
@@ -232,23 +292,29 @@ def _load_hunyuan_image3_vae(
 
     vae = AutoencoderKLConv3D(vae_config).to(device=device, dtype=torch.float32)
     loaded = _load_prefixed_parameters(vae, safetensors_files, "vae.")
+    for param in vae.parameters():
+        param.requires_grad = False
     logger.info("Loaded %d VAE parameter(s) from %s", loaded, local_model_path)
-    return vae
+    return vae.eval()
 
 
 def _load_hunyuan_image3_image_encoder(
     hf_config: dict[str, Any],
     safetensors_files: list[str],
     device: torch.device,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
+    vit_config = hf_config.get("vit", None)
+    if vit_config is None:
+        raise ValueError(
+            "HunyuanImage3 image encoder was requested, but config.json does "
+            "not contain a 'vit' section."
+        )
+
     from sglang.multimodal_gen.runtime.models.encoders.siglip2 import (
         LightProjector,
         Siglip2VisionTransformer,
     )
-
-    vit_config = hf_config.get("vit", None)
-    if vit_config is None:
-        return None
+    from transformers import Siglip2ImageProcessorFast
 
     vision_model = Siglip2VisionTransformer(vit_config).to(
         device=device, dtype=torch.bfloat16
@@ -268,6 +334,12 @@ def _load_hunyuan_image3_image_encoder(
         if vision_aligner is not None
         else 0
     )
+    for module in (vision_model, vision_aligner):
+        if module is None:
+            continue
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
     logger.info(
         "Loaded %d vision_model and %d vision_aligner parameter(s)",
         loaded_vision,
@@ -276,7 +348,11 @@ def _load_hunyuan_image3_image_encoder(
     return {
         "vision_model": vision_model,
         "vision_aligner": vision_aligner,
-        "vit_processor_config": hf_config.get("vit_processor", None),
+        "vit_processor": Siglip2ImageProcessorFast.from_dict(
+            hf_config["vit_processor"]
+        )
+        if hf_config.get("vit_processor") is not None
+        else None,
     }
 
 
@@ -296,52 +372,38 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, Any]:
         """Load HunyuanImage-3.0 components from the flat checkpoint layout."""
-        from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
-            resolve_transformer_safetensors_to_load,
-        )
-        from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
         from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
             get_diffusers_component_config,
         )
         from transformers import AutoTokenizer
 
-        local_model_path = _resolve_hunyuan_image3_model_path(server_args.model_path)
+        loaded_modules = loaded_modules or {}
+        local_model_path = _resolve_hunyuan_image3_checkpoint(server_args.model_path)
         hf_config = get_diffusers_component_config(local_model_path)
-        safetensors_files = sorted(
-            glob.glob(os.path.join(local_model_path, "*.safetensors"))
+        safetensors_files = _list_hunyuan_image3_safetensors(
+            local_model_path, "checkpoint"
         )
         device = get_local_torch_device()
 
         components: dict[str, Any] = {}
 
-        if loaded_modules and "tokenizer" in loaded_modules:
+        if "tokenizer" in loaded_modules:
             components["tokenizer"] = loaded_modules["tokenizer"]
         else:
             components["tokenizer"] = AutoTokenizer.from_pretrained(local_model_path)
 
-        if loaded_modules and "transformer" in loaded_modules:
+        if "transformer" in loaded_modules:
             components["transformer"] = loaded_modules["transformer"]
         else:
-            transformer_config = dict(hf_config)
-            transformer_config.setdefault("_class_name", "HunyuanImage3DiT")
-            dit_config = server_args.pipeline_config.dit_config
-            dit_config.update_model_arch(transformer_config)
-
-            cls_name = transformer_config.pop("_class_name")
-            model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
-            safetensors_list = resolve_transformer_safetensors_to_load(
-                server_args, local_model_path
-            )
-            components["transformer"] = _load_hunyuan_image3_transformer(
-                model_cls=model_cls,
-                init_params={"config": dit_config, "hf_config": transformer_config},
-                safetensors_list=safetensors_list,
-                device=device,
+            components["transformer"] = _load_hunyuan_image3_transformer_component(
                 server_args=server_args,
+                hf_config=hf_config,
+                local_model_path=local_model_path,
+                device=device,
             )
             server_args.model_loaded["transformer"] = True
 
-        if loaded_modules and "vae" in loaded_modules:
+        if "vae" in loaded_modules:
             components["vae"] = loaded_modules["vae"]
         else:
             components["vae"] = _load_hunyuan_image3_vae(
@@ -357,13 +419,24 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             shift=flow_shift,
         )
 
-        task_type = getattr(server_args.pipeline_config, "task_type", None)
-        if task_type is not None and task_type.accepts_image_input():
+        if "image_encoder" in loaded_modules:
+            components["image_encoder"] = loaded_modules["image_encoder"]
+        elif "image_encoder" in server_args.component_paths:
+            image_encoder_path = os.path.abspath(
+                os.path.expanduser(server_args.component_paths["image_encoder"])
+            )
+            if image_encoder_path != os.path.abspath(local_model_path):
+                raise ValueError(
+                    "HunyuanImage3 image encoder is stored in the main flat "
+                    "checkpoint. Set --image-encoder-path to the same path as "
+                    "--model-path to enable TI2I."
+                )
             components["image_encoder"] = _load_hunyuan_image3_image_encoder(
                 hf_config,
                 safetensors_files,
                 device,
             )
+            server_args.model_loaded["image_encoder"] = True
 
         logger.info(
             "HunyuanImage3Pipeline loaded all components from %s",

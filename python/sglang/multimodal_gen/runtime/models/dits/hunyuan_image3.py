@@ -23,6 +23,9 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DiTConfig,
 )
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
@@ -31,6 +34,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -984,6 +990,7 @@ class HunYuanAttention(nn.Module):
         kv_cache: HunyuanImage3LayerKVCache | None = None,
         cache_position: torch.Tensor | None = None,
         cache_end: int | None = None,
+        skip_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -1028,6 +1035,7 @@ class HunYuanAttention(nn.Module):
                 k_backend,
                 v_backend,
                 attn_mask=attention_mask,
+                skip_sequence_parallel_override=skip_sequence_parallel,
             )
 
         # [B, L, H_local, D_h] -> [B, L, H_local*D_h]
@@ -1238,6 +1246,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         kv_cache: HunyuanImage3LayerKVCache | None = None,
         cache_position: torch.Tensor | None = None,
         cache_end: int | None = None,
+        skip_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1249,6 +1258,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             kv_cache=kv_cache,
             cache_position=cache_position,
             cache_end=cache_end,
+            skip_sequence_parallel=skip_sequence_parallel,
         )
         hidden_states = residual + hidden_states
 
@@ -1370,8 +1380,14 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
 
-        # Token embedding
-        self.embed_tokens = nn.Embedding(self.vocab_size, arch.hidden_size)
+        # Token embedding / LM head use vocab parallelism to match the TP
+        # execution style used by SGLang language models.
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            arch.hidden_size,
+            org_num_embeddings=self.vocab_size,
+            prefix="embed_tokens",
+        )
 
         # Per-layer MoE parameters: config.json uses lists for moe_topk,
         # moe_intermediate_size, num_shared_expert — one entry per layer.
@@ -1409,9 +1425,15 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.norm = RMSNorm(arch.hidden_size, eps=getattr(arch, "rms_norm_eps", 1e-5))
 
         # AR text generation head (independent weights, not tied to embed_tokens)
-        self.lm_head = nn.Linear(arch.hidden_size, self.vocab_size, bias=False)
+        self.lm_head = VocabParallelEmbedding(
+            self.vocab_size,
+            arch.hidden_size,
+            org_num_embeddings=self.vocab_size,
+            prefix="lm_head",
+        )
         if getattr(arch, "tie_word_embeddings", False):
             self.lm_head.weight = self.embed_tokens.weight
+        self._lm_head_mapping: torch.Tensor | None = None
 
         # Timestep embedders
         self.time_embed = TimestepEmbedder(hidden_size=arch.hidden_size)
@@ -1441,8 +1463,31 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Resolution group for bucketing
         self.reso_group = ResolutionGroup(
             base_size=arch.image_base_size,
-            extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+            extra_resolutions=[
+                Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS
+            ],
         )
+
+    def _compute_ar_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states)
+        if self.lm_head.tp_size <= 1:
+            return logits[..., : self.vocab_size]
+
+        logits = tensor_model_parallel_all_gather(
+            logits, dim=-1, tp_group=self.lm_head.tp_group
+        )
+        if (
+            self._lm_head_mapping is None
+            or self._lm_head_mapping.device != logits.device
+        ):
+            mapping = self.lm_head.get_sharded_to_full_mapping()
+            if mapping is not None:
+                self._lm_head_mapping = torch.tensor(
+                    mapping, device=logits.device, dtype=torch.long
+                )
+        if self._lm_head_mapping is not None:
+            logits = logits.index_select(-1, self._lm_head_mapping)
+        return logits[..., : self.vocab_size]
 
     def _forward_ar_text(
         self,
@@ -1462,6 +1507,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         """
         hidden_states = self.embed_tokens(input_ids)
         caches = kv_caches if use_cache else None
+        skip_sequence_parallel = attention_mask is not None or caches is not None
         for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -1470,9 +1516,10 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 kv_cache=caches[layer_idx] if caches is not None else None,
                 cache_position=cache_position,
                 cache_end=cache_end,
+                skip_sequence_parallel=skip_sequence_parallel,
             )
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states[:, -1, :])
+        logits = self._compute_ar_logits(hidden_states[:, -1, :])
         if use_cache:
             return logits, caches
         return logits
@@ -1700,6 +1747,20 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         kv_caches = HunyuanImage3ARCache(
             len(self.layers), max_cache_len=total_seq_len
         )
+        sync_group = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+                get_world_group,
+            )
+
+            sync_group = get_world_group()
+            if sync_group.world_size <= 1:
+                sync_group = None
+        if sync_group is not None:
+            logger.info(
+                "AR text generation synchronizes sampled tokens across %d ranks",
+                sync_group.world_size,
+            )
         initial_position_ids = None
         if position_ids is not None:
             initial_position_ids = position_ids.to(device=device, dtype=torch.long)
@@ -1773,13 +1834,19 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             logits, kv_caches = outputs
 
-            # 1. Apply logits processor
-            if logits_processor is not None:
+            should_sample = sync_group is None or sync_group.rank_in_group == 0
+
+            # 1. Apply logits processor only on the sampling rank.
+            if logits_processor is not None and should_sample:
                 logits = logits_processor(logits, generated)
 
-            # 2. Sample next token
-            if top_k == 1:
+            # 2. Sample next token on rank 0, then broadcast it so replicated
+            # AR ranks keep identical CoT / ratio sequences.
+            if not should_sample:
+                next_token_id = None
+            elif top_k == 1:
                 next_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
+                next_token_id = int(next_token.item())
             else:
                 logits = logits / max(temperature, 1e-8)
                 if top_k > 1:
@@ -1800,8 +1867,13 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                     )
                 probs = torch.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
+                next_token_id = int(next_token.item())
+            if sync_group is not None:
+                next_token_id = sync_group.broadcast_object(next_token_id, src=0)
 
-            next_token_id = int(next_token.item())
+            next_token = torch.tensor(
+                [[next_token_id]], device=device, dtype=generated.dtype
+            )
             generated = torch.cat([generated, next_token], dim=1)
 
             # 3. Check stopping conditions

@@ -1750,26 +1750,9 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
         vae_transform = T.Compose([T.ToTensor(), T.Normalize([0.5], [0.5])])
 
-        # Prepare ViT processor once (if available)
-        vit_processor = None
-        vision_model = None
-        vision_aligner = None
-        if self.image_encoder is not None:
-            vision_model = self.image_encoder["vision_model"]
-            vision_aligner = self.image_encoder["vision_aligner"]
-            vit_processor_config = self.image_encoder.get("vit_processor_config")
-            if vit_processor_config is not None:
-                try:
-                    from transformers import Siglip2ImageProcessorFast
-
-                    vit_processor = Siglip2ImageProcessorFast.from_dict(
-                        vit_processor_config
-                    )
-                except ImportError:
-                    logger.warning(
-                        "Siglip2ImageProcessorFast not available, "
-                        "skipping ViT condition encoding"
-                    )
+        vision_model = self.image_encoder["vision_model"]
+        vision_aligner = self.image_encoder["vision_aligner"]
+        vit_processor = self.image_encoder.get("vit_processor")
 
         cond_vae_image_list = []
         cond_t_list = []
