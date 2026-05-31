@@ -215,7 +215,9 @@ class HunyuanImage3Tokenizer:
         if isinstance(tokenizer, str):
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer, trust_remote_code=True
+            )
         self.tokenizer = tokenizer
 
         # Extract special token IDs
@@ -1604,7 +1606,9 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
                 gen_token_ids
             )
             raw_decoded = self.tokenizer_wrapper.tokenizer.decode(
-                gen_token_ids, skip_special_tokens=False
+                gen_token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
             )
             logger.info(
                 "AR generation raw output: token_ids=%s token_strs=%s raw_decoded=%r parsed_cot=%r",
@@ -1939,7 +1943,11 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         gen_tokens = self._strip_trailing_structural_tokens(gen_tokens)
 
         # Decode generated tokens to text
-        cot_text = tw.tokenizer.decode(gen_tokens.tolist(), skip_special_tokens=False)
+        cot_text = tw.tokenizer.decode(
+            gen_tokens.tolist(),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
         if cot_text:
             if bot_task in ("think", "think_recaption") and not cot_text.startswith(
                 tw.think_token

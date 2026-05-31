@@ -73,8 +73,8 @@ def _hunyuan_image3_transformer_weight_iterator(
     """Yield only flat-checkpoint weights that belong to the DiT transformer.
 
     Names are mapped via param_names_mapping so that the downstream
-    ``load_weights`` method receives checkpoint-format names that it can
-    further remap (e.g. FusedMoE expert stacking).
+    ``load_weights`` method receives checkpoint-format names aligned with
+    the model-local HunyuanImage3 parameter layout.
     """
     weight_converter = getattr(model, "convert_checkpoint_weight_for_loading", None)
 
@@ -104,11 +104,11 @@ def _load_hunyuan_image3_transformer(
     tensors. Filtering here keeps the loader strict while allowing this
     model-specific flat layout.
 
-    Expert Parallelism (EP) is handled by FusedMoE internally: each EP rank
-    only loads the expert weights it owns (num_experts // ep_size).
+    HunyuanImage3 currently uses a model-local sparse-MoE implementation, so
+    all routed expert weights are loaded directly into the transformer module
+    rather than being repacked into the shared srt fused-MoE stack.
     """
     param_dtype = HUNYUAN_IMAGE3_TRANSFORMER_DTYPE
-
     with set_default_torch_dtype(param_dtype):
         model = model_cls(config=dit_config, hf_config=hf_config)
 
@@ -119,7 +119,7 @@ def _load_hunyuan_image3_transformer(
         param_names_mapping_fn,
     )
 
-    # Load weights directly (no FSDP sharding needed with EP).
+    # Load weights directly into the model-local Hunyuan transformer layout.
     model.load_weights(weight_iterator)
 
     model.post_load_weights()
@@ -315,7 +315,10 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         if "tokenizer" in loaded_modules:
             components["tokenizer"] = loaded_modules["tokenizer"]
         else:
-            components["tokenizer"] = AutoTokenizer.from_pretrained(local_model_path)
+            components["tokenizer"] = AutoTokenizer.from_pretrained(
+                local_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+            )
 
         if "transformer" in loaded_modules:
             components["transformer"] = loaded_modules["transformer"]

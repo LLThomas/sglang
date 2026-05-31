@@ -10,9 +10,11 @@
 
 import logging
 import math
+import re
 import time
 from contextlib import nullcontext
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 import numpy as np
@@ -24,7 +26,9 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DiTConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_group, get_tp_rank
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
@@ -36,6 +40,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.utils import get_group_size
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -48,15 +53,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.distributed.communication_op import (
-    moe_expert_parallel_all_reduce,
-    moe_tensor_model_parallel_all_reduce,
-)
-from sglang.srt.distributed.parallel_state import (
-    get_moe_expert_parallel_world_size,
-    get_moe_tensor_parallel_world_size,
-)
 from sglang.srt.utils import is_cuda
 
 try:
@@ -65,6 +61,328 @@ except ImportError:
     dist = None
 
 logger = logging.getLogger(__name__)
+
+
+class HunyuanTopKOutput:
+    def __init__(self, topk_weights: torch.Tensor, topk_ids: torch.Tensor):
+        self.topk_weights = topk_weights
+        self.topk_ids = topk_ids
+
+
+@dataclass
+class HunyuanFlatRouting:
+    expert_ids: torch.Tensor
+    token_indices: torch.Tensor
+    scores: torch.Tensor
+
+
+class HunyuanFusedExpertWeights(nn.Module):
+    """Fused routed-expert weights with TP-aware load and execution.
+
+    The stored layout mirrors the local TP execution contract:
+    - ``w13_weight`` keeps the merged gate/up projection in ``[E, K, N]``
+      form, where ``N = 2 * intermediate_size_per_partition``.
+    - ``w2_weight`` keeps the row-parallel down projection in
+      ``[E, K, N]`` form, where ``K = intermediate_size_per_partition`` and
+      ``N = hidden_size``.
+
+    This keeps checkpoint loading, CPU fallback execution, NPU grouped-matmul
+    execution, and TP output reduction in one place, so the outer MoE block
+    only needs to handle routing and shared-expert composition.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        if bias:
+            raise NotImplementedError("Hunyuan routed fused experts do not support bias")
+
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.tp_group = get_tp_group()
+        self.tp_rank = get_tp_rank()
+        self.tp_size = get_group_size(self.tp_group)
+        self.intermediate_size_per_partition = divide(intermediate_size, self.tp_size)
+        self.act_fn = SiluAndMul()
+        self.register_buffer(
+            "_token_idx_cache", torch.empty(0, dtype=torch.long), persistent=False
+        )
+
+        w13_weight = nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                2 * self.intermediate_size_per_partition,
+            ),
+            requires_grad=False,
+        )
+        setattr(w13_weight, "weight_loader", self.load_w13_weight)
+        self.register_parameter("w13_weight", w13_weight)
+
+        w2_weight = nn.Parameter(
+            torch.empty(
+                num_experts,
+                self.intermediate_size_per_partition,
+                hidden_size,
+            ),
+            requires_grad=False,
+        )
+        setattr(w2_weight, "weight_loader", self.load_w2_weight)
+        self.register_parameter("w2_weight", w2_weight)
+
+    def load_w13_weight(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_kind: str,
+        expert_id: int,
+    ) -> None:
+        if shard_kind not in {"gate", "up", "gate_up"}:
+            raise ValueError(f"Unsupported routed w13 shard kind: {shard_kind}")
+
+        shard_size = self.intermediate_size_per_partition
+        if shard_kind == "gate_up":
+            if loaded_weight.shape[0] == shard_size * 2:
+                param.data[expert_id].copy_(loaded_weight.transpose(0, 1))
+                return
+
+            gate_full = loaded_weight.narrow(0, 0, self.intermediate_size)
+            up_full = loaded_weight.narrow(0, self.intermediate_size, self.intermediate_size)
+            gate_local = gate_full.narrow(0, self.tp_rank * shard_size, shard_size)
+            up_local = up_full.narrow(0, self.tp_rank * shard_size, shard_size)
+            param.data[expert_id, :, :shard_size].copy_(gate_local.transpose(0, 1))
+            param.data[expert_id, :, shard_size:].copy_(up_local.transpose(0, 1))
+            return
+        elif shard_kind == "gate":
+            start = 0
+            if loaded_weight.shape[0] == shard_size:
+                param.data[expert_id, :, start : start + shard_size].copy_(
+                    loaded_weight.transpose(0, 1)
+                )
+                return
+            width = shard_size
+        else:
+            start = shard_size
+            if loaded_weight.shape[0] == shard_size:
+                param.data[expert_id, :, start : start + shard_size].copy_(
+                    loaded_weight.transpose(0, 1)
+                )
+                return
+            width = shard_size
+
+        local_weight = loaded_weight.narrow(0, self.tp_rank * width, width)
+        param.data[expert_id, :, start : start + width].copy_(
+            local_weight.transpose(0, 1)
+        )
+
+    def load_w2_weight(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_kind: str,
+        expert_id: int,
+    ) -> None:
+        if shard_kind != "down":
+            raise ValueError(f"Unsupported routed w2 shard kind: {shard_kind}")
+
+        shard_size = self.intermediate_size_per_partition
+        if loaded_weight.shape[1] == shard_size:
+            local_weight = loaded_weight
+        else:
+            local_weight = loaded_weight.narrow(1, self.tp_rank * shard_size, shard_size)
+        param.data[expert_id].copy_(local_weight.transpose(0, 1))
+
+    def forward_expert(self, hidden_states: torch.Tensor, expert_id: int) -> torch.Tensor:
+        gate_up = F.linear(hidden_states, self.w13_weight[expert_id].transpose(0, 1))
+        hidden_states = self.act_fn(gate_up)
+        return F.linear(hidden_states, self.w2_weight[expert_id].transpose(0, 1))
+
+    def _reduce_tp_output(self, output: torch.Tensor) -> torch.Tensor:
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output, tp_group=self.tp_group)
+        return output
+
+    def _get_token_indices(
+        self, num_tokens: int, top_k: int, device: torch.device
+    ) -> torch.Tensor:
+        if (
+            self._token_idx_cache.device != device
+            or self._token_idx_cache.numel() < num_tokens
+        ):
+            self._token_idx_cache = torch.arange(
+                num_tokens, device=device, dtype=torch.long
+            )
+        token_idx = self._token_idx_cache.narrow(0, 0, num_tokens)
+        return token_idx.unsqueeze(1).expand(num_tokens, top_k).reshape(-1)
+
+    def _flatten_routing(
+        self, hidden_states: torch.Tensor, topk_output: HunyuanTopKOutput
+    ) -> HunyuanFlatRouting:
+        num_tokens = hidden_states.shape[0]
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+        return HunyuanFlatRouting(
+            expert_ids=topk_ids.reshape(-1),
+            token_indices=self._get_token_indices(
+                num_tokens, topk_ids.shape[1], hidden_states.device
+            ),
+            scores=topk_weights.reshape(-1).to(hidden_states.dtype),
+        )
+
+    def _run_npu_grouped(
+        self, hidden_states: torch.Tensor, topk_output: HunyuanTopKOutput
+    ) -> torch.Tensor:
+        if self.w13_weight.shape[1] != hidden_states.shape[-1]:
+            raise RuntimeError(
+                "Packed MoE w13 layout mismatch: "
+                f"hidden_states K={hidden_states.shape[-1]} "
+                f"but w13 expects K={self.w13_weight.shape[1]}"
+            )
+
+        topk_ids = topk_output.topk_ids.to(torch.int32)
+        topk_weights = topk_output.topk_weights.to(hidden_states.dtype)
+        num_tokens, top_k = topk_ids.shape
+
+        hidden_states_routed, expanded_row_idx, expert_tokens, _ = (
+            torch.ops.npu.npu_moe_init_routing_v2(
+                hidden_states,
+                topk_ids,
+                active_num=num_tokens * top_k,
+                expert_num=self.num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[0, self.num_experts],
+                quant_mode=-1,
+            )
+        )
+        expert_tokens = expert_tokens.to(torch.int64)
+
+        hidden_states_routed = torch.ops.npu.npu_grouped_matmul(
+            x=[hidden_states_routed],
+            weight=[self.w13_weight],
+            bias=None,
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=hidden_states.dtype,
+        )[0]
+        hidden_states_routed = torch.ops.npu.npu_swiglu(hidden_states_routed)
+        if self.w2_weight.shape[1] != hidden_states_routed.shape[-1]:
+            raise RuntimeError(
+                "Packed MoE w2 layout mismatch: "
+                f"hidden_states K={hidden_states_routed.shape[-1]} "
+                f"but w2 expects K={self.w2_weight.shape[1]}"
+            )
+        hidden_states_routed = torch.ops.npu.npu_grouped_matmul(
+            x=[hidden_states_routed],
+            weight=[self.w2_weight],
+            bias=None,
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_tokens,
+            output_dtype=hidden_states.dtype,
+        )[0]
+
+        output = torch.ops.npu.npu_moe_finalize_routing(
+            hidden_states_routed,
+            skip1=None,
+            skip2=None,
+            bias=None,
+            scales=topk_weights,
+            expanded_src_to_dst_row=expanded_row_idx,
+            export_for_source_row=topk_ids,
+            drop_pad_mode=2,
+        )
+        return self._reduce_tp_output(output)
+
+    def _run_sorted_local(
+        self, hidden_states: torch.Tensor, routing: HunyuanFlatRouting
+    ) -> torch.Tensor:
+        output = torch.zeros_like(hidden_states)
+
+        sort_order = torch.argsort(routing.expert_ids)
+        sorted_expert_ids = routing.expert_ids.index_select(0, sort_order)
+        sorted_token_indices = routing.token_indices.index_select(0, sort_order)
+        sorted_scores = routing.scores.index_select(0, sort_order)
+
+        unique_expert_ids, counts = torch.unique_consecutive(
+            sorted_expert_ids, return_counts=True
+        )
+        offset = 0
+        for expert_idx_tensor, count_tensor in zip(unique_expert_ids, counts):
+            count = int(count_tensor.item())
+            if count == 0:
+                continue
+            expert_idx = int(expert_idx_tensor.item())
+            token_indices = sorted_token_indices.narrow(0, offset, count)
+            score_slice = sorted_scores.narrow(0, offset, count)
+            tokens = hidden_states.index_select(0, token_indices)
+            expert_out = self.forward_expert(tokens, expert_idx)
+            output.index_add_(
+                0, token_indices, expert_out * score_slice.unsqueeze(-1)
+            )
+            offset += count
+        return self._reduce_tp_output(output)
+
+    def forward_routed(
+        self, hidden_states: torch.Tensor, topk_output: HunyuanTopKOutput
+    ) -> torch.Tensor:
+        if hidden_states.device.type == "npu":
+            return self._run_npu_grouped(hidden_states, topk_output)
+        routing = self._flatten_routing(hidden_states, topk_output)
+        return self._run_sorted_local(hidden_states, routing)
+
+
+class HunyuanTopKRouter(nn.Module):
+    def __init__(
+        self,
+        top_k: int,
+        *,
+        renormalize: bool = True,
+        scoring_func: str = "softmax",
+    ) -> None:
+        super().__init__()
+        if scoring_func != "softmax":
+            raise ValueError(
+                f"HunyuanTopKRouter only supports softmax routing, got {scoring_func}"
+            )
+        self.top_k = top_k
+        self.renormalize = renormalize
+
+    def forward(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> HunyuanTopKOutput:
+        del hidden_states
+        topk_weights, topk_ids = self._route(router_logits)
+        return HunyuanTopKOutput(topk_weights=topk_weights, topk_ids=topk_ids)
+
+    def _route(
+        self, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if router_logits.device.type == "npu":
+            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+                router_logits, k=self.top_k
+            )
+            if self.renormalize:
+                denom = topk_weights.sum(dim=-1, keepdim=True).clamp_min_(1e-20)
+                topk_weights = topk_weights / denom
+            return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+        scores = torch.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(scores, self.top_k, dim=-1)
+        if self.renormalize:
+            denom = topk_weights.sum(dim=-1, keepdim=True).clamp_min_(1e-20)
+            topk_weights = topk_weights / denom
+        return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
 def _is_rank0() -> bool:
@@ -1106,11 +1424,11 @@ class HunYuanMLP(nn.Module):
 
 
 class HunYuanSparseMoeBlock(nn.Module):
-    """MoE block using TopK routing + per-expert HunYuanMLP.
+    """Sparse MoE block with model-local routing and fused routed-expert weights.
 
     Supports dual-stream parallelism (GPU only): shared_mlp runs on the main
-    stream while routed experts run on alt_stream.  On NPU (or when
-    alt_stream is None), falls back to single-stream sequential execution.
+    stream while routed experts run on alt_stream. On NPU (or when alt_stream
+    is None), falls back to single-stream sequential execution.
     """
 
     def __init__(
@@ -1125,8 +1443,6 @@ class HunYuanSparseMoeBlock(nn.Module):
         alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
-        self.tp_size = get_moe_tensor_parallel_world_size()
-        self.ep_size = get_moe_expert_parallel_world_size()
         self.alt_stream = alt_stream
 
         # FP32 router gate (replicated on all ranks)
@@ -1139,26 +1455,18 @@ class HunYuanSparseMoeBlock(nn.Module):
         )
 
         # TopK routing: softmax scoring + renormalize (matches official model)
-        self.topk = TopK(
+        self.topk = HunyuanTopKRouter(
             top_k=top_k,
             renormalize=True,
             scoring_func="softmax",
-            use_grouped_topk=False,
-            num_expert_group=1,
-            topk_group=1,
         )
 
         # Routed experts
-        self.experts = nn.ModuleList(
-            [
-                HunYuanMLP(
-                    hidden_size=hidden_size,
-                    intermediate_size=intermediate_size,
-                    bias=bias,
-                    prefix=f"{prefix}.experts.{idx}" if prefix else f"experts.{idx}",
-                )
-                for idx in range(num_experts)
-            ]
+        self.routed_experts = HunyuanFusedExpertWeights(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            bias=bias,
         )
 
         # Shared expert
@@ -1170,56 +1478,6 @@ class HunYuanSparseMoeBlock(nn.Module):
                 bias=bias,
                 prefix=f"{prefix}.shared_mlp" if prefix else "shared_mlp",
             )
-
-    def _run_experts(self, hidden_states: torch.Tensor, topk_output) -> torch.Tensor:
-        """Dispatch tokens to experts and compute routed output."""
-        num_tokens = hidden_states.shape[0]
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
-
-        flat_expert_ids = topk_ids.reshape(-1)
-        flat_token_idx = torch.arange(
-            num_tokens, device=hidden_states.device, dtype=torch.long
-        ).repeat_interleave(topk_ids.shape[1])
-        flat_scores = topk_weights.reshape(-1).to(hidden_states.dtype)
-
-        output = torch.zeros_like(hidden_states)
-        # Ascend's bool advanced indexing lowers to NonZero and can time out on
-        # large MoE routing workloads. Use sort + contiguous slices on NPU to
-        # avoid mask/nonzero-based dispatch.
-        if hidden_states.device.type == "npu":
-            sort_order = torch.argsort(flat_expert_ids)
-            sorted_expert_ids = flat_expert_ids.index_select(0, sort_order)
-            sorted_token_idx = flat_token_idx.index_select(0, sort_order)
-            sorted_scores = flat_scores.index_select(0, sort_order)
-
-            unique_expert_ids, counts = torch.unique_consecutive(
-                sorted_expert_ids, return_counts=True
-            )
-            offset = 0
-            for expert_idx_tensor, count_tensor in zip(unique_expert_ids, counts):
-                count = int(count_tensor.item())
-                if count == 0:
-                    continue
-                expert_idx = int(expert_idx_tensor.item())
-                token_slice = sorted_token_idx.narrow(0, offset, count)
-                score_slice = sorted_scores.narrow(0, offset, count)
-                tokens = hidden_states.index_select(0, token_slice)
-                expert_out = self.experts[expert_idx](tokens)
-                scaled = expert_out * score_slice.unsqueeze(-1)
-                output.index_add_(0, token_slice, scaled)
-                offset += count
-            return output
-
-        for expert_idx, expert in enumerate(self.experts):
-            mask = flat_expert_ids == expert_idx
-            if not mask.any():
-                continue
-            tokens = hidden_states.index_select(0, flat_token_idx[mask])
-            expert_out = expert(tokens)
-            scaled = expert_out * flat_scores[mask].unsqueeze(-1)
-            output.index_add_(0, flat_token_idx[mask], scaled)
-        return output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -1237,7 +1495,7 @@ class HunYuanSparseMoeBlock(nn.Module):
 
             self.alt_stream.wait_stream(current_stream)
             with torch.cuda.stream(self.alt_stream):
-                routed_output = self._run_experts(
+                routed_output = self.routed_experts.forward_routed(
                     hidden_states_flat, topk_output
                 ).view(orig_shape)
             current_stream.wait_stream(self.alt_stream)
@@ -1245,7 +1503,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             output = routed_output + shared_output
         else:
             # Single-stream: sequential execution
-            routed_output = self._run_experts(
+            routed_output = self.routed_experts.forward_routed(
                 hidden_states_flat, topk_output
             ).view(orig_shape)
             output = routed_output
@@ -1548,11 +1806,46 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             ],
         )
 
+        self._routed_expert_pattern = re.compile(
+            r"^(?P<prefix>.*?\.mlp)\.experts\.(?P<expert_id>\d+)\.(?P<proj>gate_up_proj|down_proj)\.weight$"
+        )
+
+    def _match_routed_expert_weight(
+        self, name: str
+    ) -> tuple[str, str, int] | None:
+        routed_match = self._routed_expert_pattern.match(name)
+        if routed_match is None:
+            return None
+
+        prefix = routed_match.group("prefix")
+        expert_id = int(routed_match.group("expert_id"))
+        proj = routed_match.group("proj")
+        if proj == "gate_up_proj":
+            return f"{prefix}.routed_experts.w13_weight", "gate_up", expert_id
+        return f"{prefix}.routed_experts.w2_weight", "down", expert_id
+
+    def _load_routed_expert_weight(
+        self,
+        params_dict: dict[str, nn.Parameter],
+        name: str,
+        loaded_weight: torch.Tensor,
+    ) -> str | None:
+        routed_info = self._match_routed_expert_weight(name)
+        if routed_info is None:
+            return None
+
+        target_name, shard_kind, expert_id = routed_info
+        param = params_dict.get(target_name)
+        if param is None:
+            return target_name
+        param.weight_loader(param, loaded_weight, shard_kind, expert_id)
+        return target_name
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights from a checkpoint.
 
-        Expert weights are loaded directly into per-expert HunYuanMLP modules;
-        no FusedMoE-specific remapping is needed.
+        Routed expert weights are remapped into fused `w13/w2` tensors while
+        preserving the checkpoint's per-expert naming.
         """
         from sglang.multimodal_gen.runtime.loader.weight_utils import (
             default_weight_loader,
@@ -1594,6 +1887,17 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             # Map "mlp.gate.wg" → "mlp.gate" (HF checkpoint naming)
             if ".mlp.gate.wg." in name:
                 name = name.replace(".mlp.gate.wg.", ".mlp.gate.")
+
+            routed_target = self._load_routed_expert_weight(
+                params_dict, name, loaded_weight
+            )
+            if routed_target is not None:
+                if routed_target not in params_dict:
+                    record_skipped(routed_target)
+                    continue
+                loaded_count += 1
+                loaded_params.add(routed_target)
+                continue
 
             # Handle stacked params (qkv_proj).  Expert and non-expert
             # gate_up_proj weights are handled natively by
@@ -1643,6 +1947,33 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             if missing_params:
                 print(
                     f"[DEBUG] Missing params sample: {sorted(missing_params)[:40]}"
+                )
+
+    def post_load_weights(self) -> None:
+        for layer in self.layers:
+            mlp = getattr(layer, "mlp", None)
+            routed = getattr(mlp, "routed_experts", None)
+            if routed is None:
+                continue
+            expected_w13 = (
+                routed.num_experts,
+                routed.hidden_size,
+                2 * routed.intermediate_size_per_partition,
+            )
+            expected_w2 = (
+                routed.num_experts,
+                routed.intermediate_size_per_partition,
+                routed.hidden_size,
+            )
+            if tuple(routed.w13_weight.shape) != expected_w13:
+                raise RuntimeError(
+                    "Unexpected routed w13 shape: "
+                    f"got {tuple(routed.w13_weight.shape)}, expected {expected_w13}"
+                )
+            if tuple(routed.w2_weight.shape) != expected_w2:
+                raise RuntimeError(
+                    "Unexpected routed w2 shape: "
+                    f"got {tuple(routed.w2_weight.shape)}, expected {expected_w2}"
                 )
 
     def _compute_ar_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
