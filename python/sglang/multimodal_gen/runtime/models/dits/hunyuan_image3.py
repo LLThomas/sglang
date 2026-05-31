@@ -12,7 +12,8 @@ import logging
 import math
 import time
 from contextlib import nullcontext
-from typing import Any
+from collections import Counter
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -47,8 +48,29 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.distributed.communication_op import (
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.parallel_state import (
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
+)
+from sglang.srt.utils import is_cuda
+
+try:
+    import torch.distributed as dist
+except ImportError:
+    dist = None
 
 logger = logging.getLogger(__name__)
+
+
+def _is_rank0() -> bool:
+    if dist is None or not dist.is_available() or not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -1084,13 +1106,11 @@ class HunYuanMLP(nn.Module):
 
 
 class HunYuanSparseMoeBlock(nn.Module):
-    """
-    Simple top-k MoE block for single-GPU.
-    When num_experts <= 1, falls back to a regular MLP.
+    """MoE block using TopK routing + per-expert HunYuanMLP.
 
-    HunyuanImage3 is sensitive to router precision.  The official model builds
-    the router gate in fp32 and disables autocast around routing; keep the same
-    behavior here so top-k expert choices do not drift under bf16 inference.
+    Supports dual-stream parallelism (GPU only): shared_mlp runs on the main
+    stream while routed experts run on alt_stream.  On NPU (or when
+    alt_stream is None), falls back to single-stream sequential execution.
     """
 
     def __init__(
@@ -1102,10 +1122,14 @@ class HunYuanSparseMoeBlock(nn.Module):
         num_shared_expert: int = 0,
         bias: bool = False,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
+        self.tp_size = get_moe_tensor_parallel_world_size()
+        self.ep_size = get_moe_expert_parallel_world_size()
+        self.alt_stream = alt_stream
+
+        # FP32 router gate (replicated on all ranks)
         self.gate = ReplicatedLinear(
             hidden_size,
             num_experts,
@@ -1113,69 +1137,122 @@ class HunYuanSparseMoeBlock(nn.Module):
             params_dtype=torch.float32,
             prefix=f"{prefix}.gate" if prefix else "gate",
         )
+
+        # TopK routing: softmax scoring + renormalize (matches official model)
+        self.topk = TopK(
+            top_k=top_k,
+            renormalize=True,
+            scoring_func="softmax",
+            use_grouped_topk=False,
+            num_expert_group=1,
+            topk_group=1,
+        )
+
+        # Routed experts
         self.experts = nn.ModuleList(
             [
                 HunYuanMLP(
-                    hidden_size,
-                    intermediate_size,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
                     bias=bias,
                     prefix=f"{prefix}.experts.{idx}" if prefix else f"experts.{idx}",
                 )
                 for idx in range(num_experts)
             ]
         )
+
+        # Shared expert
         self.shared_mlp = None
         if num_shared_expert > 0:
             self.shared_mlp = HunYuanMLP(
-                hidden_size,
-                intermediate_size * num_shared_expert,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size * num_shared_expert,
                 bias=bias,
                 prefix=f"{prefix}.shared_mlp" if prefix else "shared_mlp",
             )
 
+    def _run_experts(self, hidden_states: torch.Tensor, topk_output) -> torch.Tensor:
+        """Dispatch tokens to experts and compute routed output."""
+        num_tokens = hidden_states.shape[0]
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+
+        flat_expert_ids = topk_ids.reshape(-1)
+        flat_token_idx = torch.arange(
+            num_tokens, device=hidden_states.device, dtype=torch.long
+        ).repeat_interleave(topk_ids.shape[1])
+        flat_scores = topk_weights.reshape(-1).to(hidden_states.dtype)
+
+        output = torch.zeros_like(hidden_states)
+        # Ascend's bool advanced indexing lowers to NonZero and can time out on
+        # large MoE routing workloads. Use sort + contiguous slices on NPU to
+        # avoid mask/nonzero-based dispatch.
+        if hidden_states.device.type == "npu":
+            sort_order = torch.argsort(flat_expert_ids)
+            sorted_expert_ids = flat_expert_ids.index_select(0, sort_order)
+            sorted_token_idx = flat_token_idx.index_select(0, sort_order)
+            sorted_scores = flat_scores.index_select(0, sort_order)
+
+            unique_expert_ids, counts = torch.unique_consecutive(
+                sorted_expert_ids, return_counts=True
+            )
+            offset = 0
+            for expert_idx_tensor, count_tensor in zip(unique_expert_ids, counts):
+                count = int(count_tensor.item())
+                if count == 0:
+                    continue
+                expert_idx = int(expert_idx_tensor.item())
+                token_slice = sorted_token_idx.narrow(0, offset, count)
+                score_slice = sorted_scores.narrow(0, offset, count)
+                tokens = hidden_states.index_select(0, token_slice)
+                expert_out = self.experts[expert_idx](tokens)
+                scaled = expert_out * score_slice.unsqueeze(-1)
+                output.index_add_(0, token_slice, scaled)
+                offset += count
+            return output
+
+        for expert_idx, expert in enumerate(self.experts):
+            mask = flat_expert_ids == expert_idx
+            if not mask.any():
+                continue
+            tokens = hidden_states.index_select(0, flat_token_idx[mask])
+            expert_out = expert(tokens)
+            scaled = expert_out * flat_scores[mask].unsqueeze(-1)
+            output.index_add_(0, flat_token_idx[mask], scaled)
+        return output
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        num_tokens = hidden_states.shape[0]
+        hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
-        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
-            router_logits, _ = self.gate(hidden_states.float())  # [N, num_experts]
-            scores = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-            top_k_scores, top_k_indices = scores.topk(self.top_k, dim=-1)
+        # FP32 router
+        router_logits, _ = self.gate(hidden_states_flat.float())
+        topk_output = self.topk(hidden_states_flat, router_logits)
 
-        if self.top_k > 1:
-            top_k_scores = top_k_scores / torch.clamp(
-                top_k_scores.sum(dim=-1, keepdim=True),
-                min=1e-8,
-            )
+        if self.alt_stream is not None and self.shared_mlp is not None:
+            # Dual-stream: shared_mlp on main stream, experts on alt stream
+            current_stream = torch.cuda.current_stream()
+            shared_output = self.shared_mlp(hidden_states)
 
-        flat_expert_indices = top_k_indices.reshape(-1)
-        flat_token_indices = torch.arange(
-            num_tokens, device=hidden_states.device, dtype=torch.long
-        ).repeat_interleave(self.top_k)
-        flat_scores = top_k_scores.reshape(-1).to(hidden_states.dtype)
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                routed_output = self._run_experts(
+                    hidden_states_flat, topk_output
+                ).view(orig_shape)
+            current_stream.wait_stream(self.alt_stream)
 
-        output = torch.zeros_like(hidden_states)
-        for expert_idx, expert in enumerate(self.experts):
-            expert_positions = torch.nonzero(
-                flat_expert_indices == expert_idx, as_tuple=False
-            ).flatten()
-            if expert_positions.numel() == 0:
-                continue
+            output = routed_output + shared_output
+        else:
+            # Single-stream: sequential execution
+            routed_output = self._run_experts(
+                hidden_states_flat, topk_output
+            ).view(orig_shape)
+            output = routed_output
+            if self.shared_mlp is not None:
+                output = output + self.shared_mlp(hidden_states)
 
-            selected_tokens = flat_token_indices.index_select(0, expert_positions)
-            expert_input = hidden_states.index_select(0, selected_tokens)
-            expert_output = expert(expert_input)
-            expert_output = expert_output * flat_scores.index_select(
-                0, expert_positions
-            ).unsqueeze(-1)
-            output.index_add_(0, selected_tokens, expert_output.to(output.dtype))
-
-        if self.shared_mlp is not None:
-            output = output + self.shared_mlp(hidden_states)
-
-        return output.view(orig_shape)
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +1278,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         layer_idx: int = 0,
         moe_layer_num_skipped: int = 0,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        alt_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -1227,6 +1305,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 top_k=moe_topk,
                 num_shared_expert=num_shared_expert,
                 prefix=f"layers.{layer_idx}.mlp",
+                alt_stream=alt_stream,
             )
         else:
             self.mlp = HunYuanMLP(
@@ -1290,7 +1369,6 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     _aliases = ["HunyuanImage3ForCausalMM", "HunyuanImage3Model"]
 
-    _fsdp_shard_conditions = HunyuanImage3DiTConfig().arch_config._fsdp_shard_conditions
     _compile_conditions = HunyuanImage3DiTConfig().arch_config._compile_conditions
     param_names_mapping = HunyuanImage3DiTConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = HunyuanImage3DiTConfig().arch_config.reverse_param_names_mapping
@@ -1356,6 +1434,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config=None,
     ):
         super().__init__(config=config, hf_config=hf_config)
+        self.alt_stream = torch.cuda.Stream() if is_cuda() else None
 
         arch = config.arch_config
         self.patch_size = arch.patch_size
@@ -1415,6 +1494,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                     layer_idx=i,
                     moe_layer_num_skipped=getattr(arch, "moe_layer_num_skipped", 0),
                     supported_attention_backends=self._supported_attention_backends,
+                    alt_stream=self.alt_stream,
                 )
                 for i in range(arch.num_hidden_layers)
             ]
@@ -1468,6 +1548,103 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             ],
         )
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        """Load weights from a checkpoint.
+
+        Expert weights are loaded directly into per-expert HunYuanMLP modules;
+        no FusedMoE-specific remapping is needed.
+        """
+        from sglang.multimodal_gen.runtime.loader.weight_utils import (
+            default_weight_loader,
+        )
+
+        stacked_params_mapping = [
+            # (param_name, weight_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+
+        params_dict = dict(self.named_parameters())
+        debug_enabled = _is_rank0()
+
+        import itertools
+        weights_peek, weights = itertools.tee(weights, 2)
+        if debug_enabled:
+            param_keys = list(params_dict.keys())
+            first_five_weights = list(itertools.islice(weights_peek, 5))
+            print(f"[DEBUG] params_dict has {len(param_keys)} parameters")
+            print(f"[DEBUG] First 5 param keys: {param_keys[:5]}")
+            print(f"[DEBUG] First 5 weight names: {[n for n, _ in first_five_weights]}")
+        loaded_count = 0
+        skipped_count = 0
+        loaded_params = set()
+        skipped_samples = []
+        skipped_prefix_counter = Counter()
+
+        def record_skipped(name: str):
+            nonlocal skipped_count
+            skipped_count += 1
+            prefix = ".".join(name.split(".")[:3])
+            skipped_prefix_counter[prefix] += 1
+            if len(skipped_samples) < 40:
+                skipped_samples.append(name)
+
+        for name, loaded_weight in weights:
+            # Map "mlp.gate.wg" → "mlp.gate" (HF checkpoint naming)
+            if ".mlp.gate.wg." in name:
+                name = name.replace(".mlp.gate.wg.", ".mlp.gate.")
+
+            # Handle stacked params (qkv_proj).  Expert and non-expert
+            # gate_up_proj weights are handled natively by
+            # MergedColumnParallelLinear's weight_loader.
+            is_stacked = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                src = f".{weight_name}."
+                dst = f".{param_name}."
+                if src not in name:
+                    continue
+                name = name.replace(src, dst)
+                if name not in params_dict:
+                    record_skipped(name)
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_count += 1
+                loaded_params.add(name)
+                is_stacked = True
+                break
+            if is_stacked:
+                continue
+
+            # Fallback: direct load
+            if name not in params_dict:
+                record_skipped(name)
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_count += 1
+            loaded_params.add(name)
+        missing_params = set(params_dict.keys()) - loaded_params
+        if debug_enabled:
+            missing_prefix_counter = Counter(".".join(name.split(".")[:3]) for name in missing_params)
+            print(
+                f"[DEBUG] load_weights summary: loaded={loaded_count}, skipped={skipped_count}, missing_params={len(missing_params)}"
+            )
+            print(
+                f"[DEBUG] Top skipped prefixes: {skipped_prefix_counter.most_common(20)}"
+            )
+            print(f"[DEBUG] Skipped sample: {skipped_samples}")
+            print(
+                f"[DEBUG] Top missing prefixes: {missing_prefix_counter.most_common(20)}"
+            )
+            if missing_params:
+                print(
+                    f"[DEBUG] Missing params sample: {sorted(missing_params)[:40]}"
+                )
+
     def _compute_ar_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states)
         if self.lm_head.tp_size <= 1:
@@ -1499,12 +1676,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         cache_end: int | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, HunyuanImage3ARCache]:
-        """Forward text tokens through the root module for AR logits.
-
-        FSDP2 requires the root module forward hook to run before any sharded
-        child module is used.  Keeping AR generation behind ``forward`` avoids
-        initializing child layer FSDP states before the root state.
-        """
+        """Forward text tokens through the root module for AR logits."""
         hidden_states = self.embed_tokens(input_ids)
         caches = kv_caches if use_cache else None
         skip_sequence_parallel = attention_mask is not None or caches is not None

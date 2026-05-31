@@ -12,14 +12,8 @@ from itertools import chain
 from typing import Any
 
 import torch
-from torch.distributed import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.loader.fsdp_load import (
-    load_model_from_full_model_state_dict,
-    shard_model,
-)
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     set_default_torch_dtype,
@@ -42,48 +36,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
     HunyuanImage3BeforeDenoisingStage,
     HunyuanImage3DenoisingStage,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
 HUNYUAN_IMAGE3_TRANSFORMER_CLASS = "HunyuanImage3DiT"
 HUNYUAN_IMAGE3_TRANSFORMER_DTYPE = torch.bfloat16
-HUNYUAN_IMAGE3_TRANSFORMER_REDUCE_DTYPE = torch.float32
-
-
-def _maybe_shard_hunyuan_image3_transformer(
-    model: torch.nn.Module,
-    server_args: ServerArgs,
-    mp_policy: MixedPrecisionPolicy,
-) -> None:
-    if not server_args.use_fsdp_inference:
-        return
-    if current_platform.is_mps():
-        logger.info("Disabling FSDP for MPS platform as it's not compatible")
-        return
-
-    model._pre_fsdp_weight_loader_params = {
-        n: p
-        for n, p in model.named_parameters()
-        if getattr(p, "weight_loader", None)
-    }
-    device_mesh = init_device_mesh(
-        current_platform.device_type,
-        mesh_shape=(server_args.hsdp_replicate_dim, server_args.hsdp_shard_dim),
-        mesh_dim_names=("replicate", "shard"),
-    )
-    shard_model(
-        model,
-        cpu_offload=server_args.dit_cpu_offload,
-        reshard_after_forward=True,
-        mp_policy=mp_policy,
-        mesh=device_mesh,
-        fsdp_shard_conditions=getattr(model, "_fsdp_shard_conditions", None),
-        pin_cpu_memory=server_args.pin_cpu_memory,
-    )
 
 
 def _resolve_hunyuan_image3_checkpoint(model_path: str) -> str:
@@ -111,29 +70,23 @@ def _hunyuan_image3_transformer_weight_iterator(
     model,
     param_names_mapping,
 ):
-    """Yield only flat-checkpoint weights that belong to the DiT transformer."""
-    valid_target_names = set(model.state_dict().keys())
+    """Yield only flat-checkpoint weights that belong to the DiT transformer.
+
+    Names are mapped via param_names_mapping so that the downstream
+    ``load_weights`` method receives checkpoint-format names that it can
+    further remap (e.g. FusedMoE expert stacking).
+    """
     weight_converter = getattr(model, "convert_checkpoint_weight_for_loading", None)
-    skipped = 0
 
     for name, tensor in safetensors_weights_iterator(safetensors_list):
         target_name, _, _ = param_names_mapping(name)
-        if target_name in valid_target_names:
-            if weight_converter is not None:
-                tensor = weight_converter(
-                    source_name=name,
-                    target_name=target_name,
-                    tensor=tensor,
-                )
-            yield name, tensor
-        else:
-            skipped += 1
-
-    if skipped:
-        logger.info(
-            "Skipped %d non-transformer tensor(s) while loading HunyuanImage3 DiT",
-            skipped,
-        )
+        if weight_converter is not None:
+            tensor = weight_converter(
+                source_name=name,
+                target_name=target_name,
+                tensor=tensor,
+            )
+        yield target_name, tensor
 
 
 def _load_hunyuan_image3_transformer(
@@ -148,27 +101,16 @@ def _load_hunyuan_image3_transformer(
     """Load HunyuanImage3 DiT from a flat repo checkpoint.
 
     The repo-root safetensors include transformer, VAE, and optional vision
-    tensors. Filtering here keeps the generic FSDP loader strict while allowing
-    this model-specific flat layout.
+    tensors. Filtering here keeps the loader strict while allowing this
+    model-specific flat layout.
+
+    Expert Parallelism (EP) is handled by FusedMoE internally: each EP rank
+    only loads the expert weights it owns (num_experts // ep_size).
     """
     param_dtype = HUNYUAN_IMAGE3_TRANSFORMER_DTYPE
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype,
-        HUNYUAN_IMAGE3_TRANSFORMER_REDUCE_DTYPE,
-        None,
-        cast_forward_inputs=False,
-    )
-    set_mixed_precision_policy(
-        param_dtype=param_dtype,
-        reduce_dtype=HUNYUAN_IMAGE3_TRANSFORMER_REDUCE_DTYPE,
-        output_dtype=None,
-        mp_policy=mp_policy,
-    )
 
-    with set_default_torch_dtype(param_dtype), torch.device("meta"):
+    with set_default_torch_dtype(param_dtype):
         model = model_cls(config=dit_config, hf_config=hf_config)
-
-    _maybe_shard_hunyuan_image3_transformer(model, server_args, mp_policy)
 
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     weight_iterator = _hunyuan_image3_transformer_weight_iterator(
@@ -176,30 +118,13 @@ def _load_hunyuan_image3_transformer(
         model,
         param_names_mapping_fn,
     )
-    layerwise_cpu_materialize = (
-        server_args.is_dit_layerwise_offload_selected
-        and not server_args.use_fsdp_inference
-    )
-    if layerwise_cpu_materialize:
-        logger.info(
-            "Loading HunyuanImage3 DiT weights on CPU for layerwise offload "
-            "initialization."
-        )
-    load_model_from_full_model_state_dict(
-        model,
-        weight_iterator,
-        device,
-        param_dtype,
-        strict=False,
-        cpu_offload=server_args.dit_cpu_offload or layerwise_cpu_materialize,
-        param_names_mapping=param_names_mapping_fn,
-    )
+
+    # Load weights directly (no FSDP sharding needed with EP).
+    model.load_weights(weight_iterator)
 
     model.post_load_weights()
 
     for name, param in chain(model.named_parameters(), model.named_buffers()):
-        if param.is_meta:
-            raise RuntimeError(f"Unexpected param or buffer {name} on meta device.")
         if isinstance(param, torch.nn.Parameter):
             param.requires_grad = False
     return model.eval()

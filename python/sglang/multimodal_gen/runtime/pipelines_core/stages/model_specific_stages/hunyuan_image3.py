@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from diffusers.utils.torch_utils import randn_tensor
-from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.dits.hunyuan_image3 import (
@@ -47,6 +47,12 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _is_rank0() -> bool:
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
 
 
 def _first_prompt(prompt):
@@ -132,7 +138,7 @@ class HunyuanImage3DenoisingStage(DenoisingStage):
                     setattr(scheduler, attr, value.to(device))
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if server_args.enable_cfg_parallel and not server_args.use_fsdp_inference:
+        if server_args.enable_cfg_parallel:
             self._ensure_broadcast_tensors_on_local_device(batch)
         return super().forward(batch, server_args)
 
@@ -1267,10 +1273,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        if (
-            self.server_args.enable_cfg_parallel
-            and not self.server_args.use_fsdp_inference
-        ):
+        if self.server_args.enable_cfg_parallel:
             return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
         return StageParallelismType.REPLICATED
 
@@ -1294,14 +1297,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         manager.begin_use(use, module=self.transformer)
 
     def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        is_fsdp_root = isinstance(self.transformer, FSDPModule)
-        if is_fsdp_root:
-            self.transformer.unshard()
-        try:
-            return self.transformer.embed_tokens(tokens)
-        finally:
-            if is_fsdp_root:
-                self.transformer.reshard()
+        return self.transformer.embed_tokens(tokens)
 
     @staticmethod
     def _build_rope_image_infos(
@@ -1601,6 +1597,22 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         cot_text, ratio_index = self._parse_ar_output(
             generated_ids[0], input_len, bot_task
         )
+        if _is_rank0():
+            gen_tokens = generated_ids[0][input_len:]
+            gen_token_ids = gen_tokens.tolist()
+            gen_token_strs = self.tokenizer_wrapper.tokenizer.convert_ids_to_tokens(
+                gen_token_ids
+            )
+            raw_decoded = self.tokenizer_wrapper.tokenizer.decode(
+                gen_token_ids, skip_special_tokens=False
+            )
+            logger.info(
+                "AR generation raw output: token_ids=%s token_strs=%s raw_decoded=%r parsed_cot=%r",
+                gen_token_ids,
+                gen_token_strs,
+                raw_decoded,
+                cot_text,
+            )
         batch.cot_text = cot_text
         if ratio_index is not None:
             batch.ratio_index = ratio_index

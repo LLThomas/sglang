@@ -274,6 +274,103 @@ def get_dp_group() -> GroupCoordinator:
 
 
 # xDiT
+def _init_srt_moe_parallel_groups(
+    tensor_parallel_degree: int,
+    backend: str,
+) -> None:
+    """Initialize *only* the srt parallel groups required by FusedMoE.
+
+    FusedMoE (used by MoE-based DiT models like HunyuanImage3) calls
+    ``get_moe_ep_group()`` / ``get_moe_tp_group()`` / ``get_tp_group()``
+    from ``sglang.srt.distributed.parallel_state``.  Rather than calling
+    the full ``srt_initialize_model_parallel`` — which would create 7-8
+    unnecessary NCCL process groups (``_ATTN_CP``, ``_ATTN_TP``,
+    ``_MOE_DP``, ``_PP``, etc.) — we selectively initialise only the
+    three groups that FusedMoE actually needs:
+
+    * ``_TP``   — used by StandardDispatcher for all-gather / reduce-scatter
+                  (only on the flashinfer-cutlass-fp4 path; still required
+                  as a valid GroupCoordinator for ``use_symmetric_memory``).
+    * ``_MOE_EP`` — when ``ep_size == tp_size``, srt sets ``_MOE_EP = _TP``
+                    (zero extra cost).
+    * ``_MOE_TP`` — when ``moe_tp_size == 1``, this is a per-rank singleton
+                    group.
+
+    This mirrors the approach taken by vllm-omni, which directly patches
+    vLLM's module-level globals (``vllm_parallel_state._EP = ...``) instead
+    of calling the full initialization routine.
+    """
+    try:
+        import sglang.srt.distributed.parallel_state as srt_ps
+    except ImportError:
+        logger.warning_once(
+            "sglang.srt.distributed is not available; "
+            "MoE Expert Parallelism will not be initialized."
+        )
+        return
+
+    if srt_ps._TP is not None:
+        # Already initialized (e.g. by srt itself in a combined deployment).
+        return
+
+    assert torch.distributed.is_initialized()
+    world_size = torch.distributed.get_world_size()
+    tp_size = tensor_parallel_degree
+    local_rank = get_world_group().local_rank
+
+    # Initialize srt's _WORLD group so that internal helpers like
+    # ``srt_ps.model_parallel_is_initialized`` can work.  This is
+    # idempotent if srt has already initialised its own world group.
+    if srt_ps._WORLD is None:
+        srt_ps._WORLD = srt_ps.init_world_group(
+            ranks=list(range(world_size)),
+            local_rank=local_rank,
+            backend=backend,
+        )
+
+    # ---- _TP ----
+    # Build TP groups matching srt's layout: contiguous chunks of tp_size.
+    num_tp_groups = world_size // tp_size
+    tp_group_ranks = [
+        list(range(g * tp_size, (g + 1) * tp_size))
+        for g in range(num_tp_groups)
+    ]
+    srt_tp = srt_ps.init_model_parallel_group(
+        group_ranks=tp_group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        group_name="tp",
+    )
+    srt_ps._TP = srt_tp
+
+    # ---- _MOE_EP (EP = TP) ----
+    # When ep_size == tp_size, srt reuses _TP directly — no new group.
+    srt_ps._MOE_EP = srt_tp
+
+    # ---- _MOE_TP (moe_tp_size == 1) ----
+    # When moe_tp_size == 1, each rank forms its own singleton group.
+    if tp_size == 1:
+        srt_ps._MOE_TP = srt_tp
+    else:
+        moe_tp_group_ranks = [[rank] for rank in range(world_size)]
+        srt_ps._MOE_TP = srt_ps.init_model_parallel_group(
+            group_ranks=moe_tp_group_ranks,
+            local_rank=local_rank,
+            backend=backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="moe_tp",
+        )
+
+    logger.info(
+        "Initialized srt MoE parallel groups (tp=%d, ep=tp, moe_tp=1) "
+        "for FusedMoE — %d of %d srt groups created",
+        tp_size,
+        3,
+        8,  # would-have-been groups if calling full srt_initialize_model_parallel
+    )
+
+
 def initialize_model_parallel(
     data_parallel_size: int = 1,
     classifier_free_guidance_degree: int = 1,
@@ -437,6 +534,13 @@ def initialize_model_parallel(
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
+
+    # Initialize srt's MOE_EP / MOE_TP groups so that FusedMoE (used by
+    # MoE-based DiT models like HunyuanImage3) can call
+    # get_moe_expert_parallel_world_size() / get_moe_tensor_parallel_world_size()
+    # without hitting an assertion.  EP size equals TP size (EP reuses the TP
+    # group), which is the simplest and most common configuration.
+    _init_srt_moe_parallel_groups(tensor_parallel_degree, backend)
 
 
 def get_sp_world_size() -> int:
@@ -853,3 +957,24 @@ def destroy_model_parallel() -> None:
             torch.distributed.destroy_process_group(group)
 
     _TP, _SP, _DP, _CFG, _PP, _DIT, _VAE = (None,) * 7
+
+    # Destroy srt MoE parallel groups that were initialised by
+    # ``_init_srt_moe_parallel_groups``.  We only tear down the groups
+    # we created; if srt's own ``initialize_model_parallel`` was called
+    # separately, srt's ``destroy_model_parallel`` handles those.
+    try:
+        import sglang.srt.distributed.parallel_state as srt_ps
+
+        # _MOE_EP aliases _TP, so only destroy _TP once.
+        if srt_ps._MOE_TP is not None and srt_ps._MOE_TP is not srt_ps._TP:
+            srt_ps._MOE_TP.destroy()
+        if srt_ps._TP is not None:
+            srt_ps._TP.destroy()
+        srt_ps._MOE_EP = None
+        srt_ps._MOE_TP = None
+        srt_ps._TP = None
+        if srt_ps._WORLD is not None:
+            srt_ps._WORLD.destroy()
+            srt_ps._WORLD = None
+    except ImportError:
+        pass

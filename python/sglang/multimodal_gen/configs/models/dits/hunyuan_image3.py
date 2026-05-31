@@ -8,7 +8,6 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 @dataclass
 class HunyuanImage3ArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=list)
     _compile_conditions: list = field(default_factory=list)
     _supported_attention_backends: set[AttentionBackendEnum] = field(
         default_factory=lambda: {
