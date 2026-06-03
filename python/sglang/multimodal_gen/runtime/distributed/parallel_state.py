@@ -474,6 +474,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     dp_size: int = 1,
+    ep_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
 ):
@@ -517,6 +518,16 @@ def maybe_init_distributed_environment_and_model_parallel(
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
     )
+
+    # Initialize SRT parallel groups so that diffusion MoE models can
+    # directly use SRT's FusedMoE / TopK layers.  This is lightweight —
+    # when ep_size=1 the MoE groups simply alias to _TP.  The MoE config
+    # globals (MOE_A2A_BACKEND, MOE_RUNNER_BACKEND, etc.) are initialized
+    # lazily when the model actually creates a FusedMoE instance.
+    from sglang.multimodal_gen.runtime.distributed.srt_moe_bridge import (
+        init_srt_parallel_groups,
+    )
+    init_srt_parallel_groups(tp_size=tp_size, ep_size=ep_size)
 
     # Only set CUDA device if we're on a CUDA platform
     if current_platform.is_cuda_alike():
