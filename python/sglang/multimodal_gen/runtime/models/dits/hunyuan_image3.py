@@ -1145,6 +1145,26 @@ class HunYuanSparseMoeBlock(nn.Module):
         # SRT fused TopK (GPU: sgl_kernel.topk_softmax; NPU: npu_moe_gating_top_k_softmax)
         self.topk = TopK(top_k=top_k, renormalize=True, scoring_func="softmax")
 
+        # NOTE: ``reduce_results`` must be ``False`` for DeepEP (and any
+        # other all-to-all dispatcher such as Mooncake / NIXL / Mori).
+        # These dispatchers handle cross-rank token routing entirely
+        # inside their own ``dispatch`` / ``combine`` phases — the
+        # combine step already returns the complete weighted sum of
+        # expert outputs for every input token on each rank.  An extra
+        # ``all_reduce`` would multiply the result by ``ep_size`` and
+        # corrupt the output.  For StandardDispatcher + TP the
+        # all-reduce is still needed and is handled inside FusedMoE via
+        # ``reduce_results=True``.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        a2a_backend = get_moe_a2a_backend()
+        self._use_deepep_or_similar = (
+            a2a_backend.is_deepep()
+            or a2a_backend.is_mooncake()
+            or a2a_backend.is_nixl()
+            or a2a_backend.is_mori()
+        )
+
         # SRT FusedMoE — owns w13/w2 weights, dispatch, fused kernels, combine
         self.experts = FusedMoE(
             num_experts=num_experts,
@@ -1152,7 +1172,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             intermediate_size=intermediate_size,
             layer_id=layer_id,
             top_k=top_k,
-            reduce_results=True,
+            reduce_results=not self._use_deepep_or_similar,
             quant_config=quant_config,
             prefix=f"{prefix}.experts" if prefix else "experts",
         )
