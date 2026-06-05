@@ -29,6 +29,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipeline
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
+    enable_cache_on_hunyuan_image3,
     enable_cache_on_transformer,
     get_scm_mask,
     refresh_context_on_dual_transformer,
@@ -346,6 +347,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return True
         return False
 
+    def _is_hunyuan_image3(self) -> bool:
+        """Check if the transformer is HunyuanImage3DiT."""
+        return self.transformer.__class__.__name__ == "HunyuanImage3DiT"
+
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
@@ -516,6 +521,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "cache-dit enabled on dual transformers (steps=%d, %d)",
                 num_high_noise_steps,
                 num_low_noise_steps,
+            )
+        elif self._is_hunyuan_image3():
+            # HunyuanImage3DiT needs a custom BlockAdapter (single-stream
+            # self.layers + Pattern_3) that differs from cache-dit's
+            # pre-registered HunyuanImage adapter (dual-stream 2.1).
+            self.transformer = enable_cache_on_hunyuan_image3(
+                self.transformer,
+                primary_config,
+                sp_group=sp_group,
+                tp_group=tp_group,
             )
         else:
             # single transformer

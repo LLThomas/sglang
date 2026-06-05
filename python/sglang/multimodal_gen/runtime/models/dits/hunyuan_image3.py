@@ -1521,6 +1521,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._routed_expert_pattern = re.compile(
             r"^(?P<prefix>.*?\.mlp)\.experts\.(?P<expert_id>\d+)\.(?P<proj>gate_up_proj|down_proj)\.weight$"
         )
+        self._teacache_skipped_steps = 0
 
     def _load_routed_expert_weight(
         self,
@@ -1871,28 +1872,119 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         # 7. Apply 2D RoPE
         hidden = inputs_embeds
 
-        # 8. Pass through transformer layers
-        for layer in self.layers:
-            hidden = layer(
-                hidden_states=hidden,
-                rope_2d=rope_2d,
-                attention_mask=encoder_attention_mask,
-            )
+        # 8. TeaCache: optionally skip the transformer layers
+        forward_batch = get_forward_context().forward_batch
+        self.enable_teacache = (
+            forward_batch is not None and forward_batch.enable_teacache
+        )
 
-        # 9. Final norm
+        should_skip_forward = self.should_skip_forward_for_cached_states(
+            modulated_inp=t_emb,
+        )
+
+        if should_skip_forward:
+            hidden = self.retrieve_cached_states(hidden)
+        else:
+            if self.enable_teacache:
+                original_hidden = hidden.clone()
+
+            # 9. Pass through transformer layers
+            for layer in self.layers:
+                hidden = layer(
+                    hidden_states=hidden,
+                    rope_2d=rope_2d,
+                    attention_mask=encoder_attention_mask,
+                )
+
+            if self.enable_teacache:
+                self.maybe_cache_states(hidden, original_hidden)
+
+        self.cnt += 1
+
+        # 10. Final norm (always runs — cheap, no reason to cache)
         hidden = self.norm(hidden)
 
-        # 10. Extract image token outputs
+        # 11. Extract image token outputs
         if image_scatter_index is not None:
             image_output = _gather_tokens_by_index(hidden, image_scatter_index)
         else:
             image_output = hidden
 
-        # 11. Project back to latent space via final_layer
+        # 12. Project back to latent space via final_layer
         t_emb_2 = self.time_embed_2(timestep)
         noise_pred = self.final_layer(image_output, t_emb_2, token_h, token_w)
 
         return noise_pred
+
+    # ------------------------------------------------------------------
+    # TeaCache overrides (inherited from TeaCacheMixin via CachableDiT)
+    # ------------------------------------------------------------------
+
+    def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
+        """Check if the transformer forward can be skipped via TeaCache.
+
+        Uses the timestep embedding (``t_emb``) as the modulated input for
+        L1-distance comparison between consecutive denoising steps.
+        """
+        if not self.enable_teacache:
+            return False
+        ctx = self._get_teacache_context()
+        if ctx is None:
+            return False
+
+        # Reset skip counter at the first step of each generation.
+        if self.cnt == 0 and not ctx.is_cfg_negative:
+            self._teacache_skipped_steps = 0
+
+        teacache_params = ctx.teacache_params
+        start_skipping, end_skipping = teacache_params.get_skip_boundaries(
+            ctx.num_inference_steps, ctx.do_cfg
+        )
+        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
+
+        modulated_inp = kwargs["modulated_inp"]
+        self.is_cfg_negative = ctx.is_cfg_negative
+
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=modulated_inp,
+            is_boundary_step=is_boundary_step,
+            coefficients=ctx.coefficients,
+            teacache_thresh=ctx.teacache_thresh,
+        )
+        skipped = not should_calc
+
+        # Log skip statistics at the last step (positive branch only).
+        if skipped:
+            self._teacache_skipped_steps += 1
+        if (
+            not self.is_cfg_negative
+            and self.cnt == ctx.num_inference_steps - 1
+        ):
+            logger.info(
+                "TeaCache: skipped %d/%d denoising steps (%.1f%%)",
+                self._teacache_skipped_steps,
+                ctx.num_inference_steps,
+                100.0 * self._teacache_skipped_steps / ctx.num_inference_steps,
+            )
+
+        return skipped
+
+    def maybe_cache_states(
+        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
+    ) -> None:
+        """Cache residual = output - input for the current CFG branch."""
+        residual = hidden_states - original_hidden_states
+        if not self.is_cfg_negative:
+            self.previous_residual = residual
+        else:
+            self.previous_residual_negative = residual
+
+    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Reuse cached residual to skip the full transformer forward."""
+        if not self.is_cfg_negative:
+            return hidden_states + self.previous_residual
+        else:
+            return hidden_states + self.previous_residual_negative
 
     @torch.no_grad()
     def generate_text(
@@ -2135,18 +2227,6 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             generated_tokens / elapsed if elapsed > 0 else 0.0,
         )
         return generated
-
-    def get_ratio_index_from_token(self, ratio_token_id: int) -> int:
-        """Map a ratio token ID to ratio_index.
-
-        Official model uses <img_ratio_0> ~ <img_ratio_32> for ratio_index 0~32.
-        The ratio_index corresponds to the position in ResolutionGroup.data.
-        Token ID resolution requires the tokenizer and is done in the stage.
-        """
-        # The tokenizer maps <img_ratio_N> -> token_id.
-        # To reverse: we need the tokenizer, which the stage has.
-        # This method is a placeholder; actual mapping is in the stage.
-        return 0
 
 
 EntryClass = HunyuanImage3DiT

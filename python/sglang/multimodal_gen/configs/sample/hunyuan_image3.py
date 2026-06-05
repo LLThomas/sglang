@@ -1,8 +1,9 @@
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType, SamplingParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 
 @dataclass
@@ -27,6 +28,23 @@ class HunyuanImage3SamplingParams(SamplingParams):
     drop_think: bool = False  # drop think portion from CoT
     image_size: str = "auto"  # "auto" = predict ratio via AR, or "HxW"
     sys_type: str = "dynamic"  # system prompt type: "None", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "dynamic", "custom"
+
+    # TeaCache params for denoising acceleration.
+    # Coefficients calibrated via polyfit on 3920 data points (80 prompts × 49 steps)
+    # from vllm-omni's HunyuanImage3 TeaCache config.
+    # Set ``enable_teacache=True`` via the API or JSON config to activate.
+    teacache_params: TeaCacheParams = field(
+        default_factory=lambda: TeaCacheParams(
+            teacache_thresh=0.2,
+            coefficients=[
+                1.04117826e02,
+                -1.26848482e02,
+                5.68168652e01,
+                -1.04182570e01,
+                6.78098549e-01,
+            ],
+        )
+    )
 
     def _adjust(self, server_args):
         self._apply_generation_config_defaults(server_args)
