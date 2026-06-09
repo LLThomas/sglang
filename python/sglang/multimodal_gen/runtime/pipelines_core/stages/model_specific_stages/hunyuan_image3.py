@@ -15,7 +15,6 @@ import random
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -32,11 +31,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    PipelineStage,
-    StageParallelismType,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -71,107 +66,6 @@ def _compose_logits_processors(processors):
         return logits
 
     return composed
-
-
-class HunyuanImage3DenoisingStage(DenoisingStage):
-    """Denoising stage with HunyuanImage3 broadcast/device validation."""
-
-    _BROADCAST_TENSOR_FIELDS = (
-        "prompt_embeds",
-        "negative_prompt_embeds",
-        "latents",
-        "timesteps",
-        "encoder_attention_mask",
-        "neg_encoder_attention_mask",
-        "image_mask",
-        "image_scatter_index",
-        "neg_image_mask",
-        "neg_image_scatter_index",
-        "timestep_scatter_index",
-        "neg_timestep_scatter_index",
-        "gen_timestep_scatter_index",
-        "neg_gen_timestep_scatter_index",
-        "cond_timestep_scatter_index",
-        "cond_vae_image_mask",
-        "cond_vae_scatter_index",
-        "cond_vit_image_mask",
-        "cond_vit_scatter_index",
-        "cond_vit_embeds",
-        "cond_vae_images",
-        "cond_timestep",
-        "rope_2d",
-        "neg_rope_2d",
-        "position_ids",
-        "neg_position_ids",
-    )
-
-    @classmethod
-    def _to_local_device(cls, value: Any, device: torch.device):
-        if isinstance(value, torch.Tensor):
-            return value.to(device)
-        if isinstance(value, list):
-            return [cls._to_local_device(item, device) for item in value]
-        if isinstance(value, tuple):
-            return tuple(cls._to_local_device(item, device) for item in value)
-        if isinstance(value, dict):
-            return {
-                key: cls._to_local_device(item, device)
-                for key, item in value.items()
-            }
-        return value
-
-    def _ensure_broadcast_tensors_on_local_device(self, batch: Req) -> None:
-        device = get_local_torch_device()
-        for field in self._BROADCAST_TENSOR_FIELDS:
-            if hasattr(batch, field):
-                setattr(
-                    batch,
-                    field,
-                    self._to_local_device(getattr(batch, field), device),
-                )
-
-        scheduler = getattr(batch, "scheduler", None)
-        if scheduler is not None:
-            for attr in ("timesteps", "sigmas"):
-                value = getattr(scheduler, attr, None)
-                if isinstance(value, torch.Tensor):
-                    setattr(scheduler, attr, value.to(device))
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if server_args.enable_cfg_parallel:
-            self._ensure_broadcast_tensors_on_local_device(batch)
-        return super().forward(batch, server_args)
-
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-
-        def timesteps_no_sync(value: Any) -> bool:
-            return isinstance(value, torch.Tensor) and value.dim() >= 1
-
-        result.add_check("timesteps", batch.timesteps, timesteps_no_sync)
-        result.add_check(
-            "prompt_embeds",
-            batch.prompt_embeds,
-            self._get_prompt_embeds_validator(batch),
-        )
-        result.add_check("image_embeds", batch.image_embeds, V.is_list)
-        result.add_check(
-            "num_inference_steps", batch.num_inference_steps, V.positive_int
-        )
-        result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
-        result.add_check("eta", batch.eta, V.non_negative_float)
-        result.add_check("generator", batch.generator, V.generator_or_list_generators)
-        result.add_check(
-            "do_classifier_free_guidance",
-            batch.do_classifier_free_guidance,
-            V.bool_value,
-        )
-        result.add_check(
-            "negative_prompt_embeds",
-            batch.negative_prompt_embeds,
-            self._get_negative_prompt_embeds_validator(batch),
-        )
-        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1273,11 +1167,11 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             ],
         )
 
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        if self.server_args.enable_cfg_parallel:
-            return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
-        return StageParallelismType.REPLICATED
+    # parallelism_type: inherited REPLICATED from PipelineStage base class.
+    # All ranks run AR + preprocessing independently.  TP all-reduce
+    # produces identical logits on every rank; with greedy sampling
+    # (default ar_top_k=1 → argmax) each rank independently picks the
+    # same token, so no cross-rank broadcast is needed (ref: vllm-omni).
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None

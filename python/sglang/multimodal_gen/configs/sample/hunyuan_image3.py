@@ -21,7 +21,7 @@ class HunyuanImage3SamplingParams(SamplingParams):
     sequence_template: str = "pretrain"  # "pretrain" or "instruct"
     system_prompt: str = ""  # system prompt (auto-selected by bot_task if empty)
     ar_max_new_tokens: int = 2048  # max tokens for AR generation
-    ar_temperature: float = 1.0  # AR sampling temperature
+    ar_temperature: float = 0.0  # AR sampling temperature (0.0 = greedy, safe for TP)
     ar_top_p: float = 1.0  # AR top-p
     ar_top_k: int = 1  # AR top-k (1 = greedy)
     ar_progress_log_interval: int = 16  # 0 disables AR token progress logs
@@ -72,7 +72,11 @@ class HunyuanImage3SamplingParams(SamplingParams):
             "bot_task": "bot_task",
             "drop_think": "drop_think",
             "max_new_tokens": "ar_max_new_tokens",
-            "temperature": "ar_temperature",
+            # NOTE: temperature is NOT read from generation_config.json.
+            # Official HY3 uses 0.6 (single-GPU), but TP distributed inference
+            # needs 0.0 (greedy) to avoid numerical-precision-induced sampling
+            # errors (e.g., model skipping CoT and generating <boi> directly).
+            # Users can still override via config: "ar_temperature": 0.6
             "top_p": "ar_top_p",
             "top_k": "ar_top_k",
         }

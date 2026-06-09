@@ -48,7 +48,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
 
 try:
     import torch.distributed as dist
@@ -988,6 +988,7 @@ class HunYuanAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             softmax_scale=self.scaling,
             causal=False,
+            skip_sequence_parallel=True,  # HY3: SP handled by TP
             supported_attention_backends=supported_attention_backends,
         )
 
@@ -1003,7 +1004,6 @@ class HunYuanAttention(nn.Module):
         kv_cache: HunyuanImage3LayerKVCache | None = None,
         cache_position: torch.Tensor | None = None,
         cache_end: int | None = None,
-        skip_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -1038,7 +1038,7 @@ class HunYuanAttention(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
-        q_backend = q.transpose(1, 2)
+        q_backend = q.transpose(1, 2)  # [B, S, H, D_h]
         k_backend = k.transpose(1, 2)
         v_backend = v.transpose(1, 2)
 
@@ -1048,7 +1048,6 @@ class HunYuanAttention(nn.Module):
                 k_backend,
                 v_backend,
                 attn_mask=attention_mask,
-                skip_sequence_parallel_override=skip_sequence_parallel,
             )
 
         # [B, L, H_local, D_h] -> [B, L, H_local*D_h]
@@ -1294,7 +1293,6 @@ class HunyuanImage3DecoderLayer(nn.Module):
         kv_cache: HunyuanImage3LayerKVCache | None = None,
         cache_position: torch.Tensor | None = None,
         cache_end: int | None = None,
-        skip_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1306,7 +1304,6 @@ class HunyuanImage3DecoderLayer(nn.Module):
             kv_cache=kv_cache,
             cache_position=cache_position,
             cache_end=cache_end,
-            skip_sequence_parallel=skip_sequence_parallel,
         )
         hidden_states = residual + hidden_states
 
@@ -1681,12 +1678,60 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 )
 
     def post_load_weights(self) -> None:
+        """Post-loading weight processing.
+
+        On NPU, MoE weight processing (transpose + NZ format conversion) is
+        deferred to the first forward call via one-shot pre-hooks. By that time
+        ``ResidentStrategy`` has already moved the model to NPU, so the
+        ``process_weights_after_loading`` call happens in-place without CPU
+        round-trips.
+
+        Pattern from vllm-omni ``HunyuanFusedMoEDefault._initialize_kernel_hook``.
+        NPU-specific transpose + NZ follows vllm-ascend
+        ``AscendUnquantizedFusedMoEMethod.process_weights_after_loading``.
+        """
+        super().post_load_weights()
+        if not is_npu():
+            return
+
         for layer in self.layers:
             mlp = getattr(layer, "mlp", None)
-            experts = getattr(mlp, "experts", None)
+            experts = getattr(mlp, "experts", None) if mlp is not None else None
             if experts is None:
                 continue
-            experts.quant_method.process_weights_after_loading(experts)
+            # Register a one-shot hook. The hook removes itself after processing,
+            # preventing double execution.
+            handle = experts.register_forward_pre_hook(self._npu_moe_init_hook)
+            experts._npu_moe_init_handle = handle
+
+        logger.info(
+            "[NPU] Registered lazy-init hooks for MoE weight processing "
+            "(transpose + NZ on first forward)."
+        )
+
+    @staticmethod
+    def _npu_moe_init_hook(module, args):
+        """One-shot hook: transpose + NZ format conversion for MoE weights.
+
+        Called on first forward when model is resident on NPU. Calls
+        ``process_weights_after_loading`` which performs:
+        1. Weight transpose: [E, N, K] -> [E, K, N] (for npu_grouped_matmul)
+        2. NZ format cast: optimal for NPU Cube engine
+
+        After processing, removes itself to prevent double execution.
+        Pattern matches vllm-omni ``HunyuanFusedMoEDefault._initialize_kernel_hook``.
+        """
+        quant_method = getattr(module, "quant_method", None)
+        if (
+            quant_method is not None
+            and hasattr(quant_method, "process_weights_after_loading")
+        ):
+            quant_method.process_weights_after_loading(module)
+
+        # One-shot: remove after first execution.
+        handle = getattr(module, "_npu_moe_init_handle", None)
+        if handle is not None:
+            handle.remove()
 
     def _compute_ar_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states)
@@ -1722,7 +1767,6 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         """Forward text tokens through the root module for AR logits."""
         hidden_states = self.embed_tokens(input_ids)
         caches = kv_caches if use_cache else None
-        skip_sequence_parallel = attention_mask is not None or caches is not None
         for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states=hidden_states,
@@ -1731,7 +1775,6 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 kv_cache=caches[layer_idx] if caches is not None else None,
                 cache_position=cache_position,
                 cache_end=cache_end,
-                skip_sequence_parallel=skip_sequence_parallel,
             )
         hidden_states = self.norm(hidden_states)
         logits = self._compute_ar_logits(hidden_states[:, -1, :])
@@ -2053,20 +2096,6 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         kv_caches = HunyuanImage3ARCache(
             len(self.layers), max_cache_len=total_seq_len
         )
-        sync_group = None
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-                get_world_group,
-            )
-
-            sync_group = get_world_group()
-            if sync_group.world_size <= 1:
-                sync_group = None
-        if sync_group is not None:
-            logger.info(
-                "AR text generation synchronizes sampled tokens across %d ranks",
-                sync_group.world_size,
-            )
         initial_position_ids = None
         if position_ids is not None:
             initial_position_ids = position_ids.to(device=device, dtype=torch.long)
@@ -2140,27 +2169,27 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             logits, kv_caches = outputs
 
-            should_sample = sync_group is None or sync_group.rank_in_group == 0
-
-            # 1. Apply logits processor only on the sampling rank.
-            if logits_processor is not None and should_sample:
+            # 1. Apply logits processor (all ranks have identical logits after
+            # All-Reduce, so applying on every rank is safe and deterministic).
+            if logits_processor is not None:
                 logits = logits_processor(logits, generated)
 
-            # 2. Sample next token on rank 0, then broadcast it so replicated
-            # AR ranks keep identical CoT / ratio sequences.
-            if not should_sample:
-                next_token_id = None
-            elif top_k == 1:
+            # 2. Sample next token.  All TP ranks hold identical logits after
+            # All-Reduce.  With greedy (top_k == 1 or temperature == 0) every
+            # rank independently picks the same token via argmax, so no
+            # cross-rank broadcast is needed.
+            if top_k == 1 or temperature <= 0:
                 next_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
                 next_token_id = int(next_token.item())
             else:
                 logits = logits / max(temperature, 1e-8)
-                if top_k > 1:
-                    top_k_val = min(top_k, logits.size(-1))
-                    topk_vals, _ = torch.topk(logits, top_k_val)
-                    logits[logits < topk_vals[:, -1:]] = float("-inf")
+                top_k_val = min(top_k, logits.size(-1))
+                topk_vals, _ = torch.topk(logits, top_k_val)
+                logits[logits < topk_vals[:, -1:]] = float("-inf")
                 if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    sorted_logits, sorted_indices = torch.sort(
+                        logits, descending=True
+                    )
                     cumulative_probs = torch.cumsum(
                         torch.softmax(sorted_logits, dim=-1), dim=-1
                     )
@@ -2174,8 +2203,6 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 probs = torch.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
                 next_token_id = int(next_token.item())
-            if sync_group is not None:
-                next_token_id = sync_group.broadcast_object(next_token_id, src=0)
 
             next_token = torch.tensor(
                 [[next_token_id]], device=device, dtype=generated.dtype
@@ -2198,7 +2225,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                     or stop_reason is not None
                 )
             )
-            if should_log_progress:
+            if should_log_progress and _is_rank0():
                 elapsed = time.perf_counter() - start_time
                 logger.info(
                     "AR text generation progress: generated_tokens=%d/%d, "

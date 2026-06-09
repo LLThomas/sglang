@@ -2,11 +2,15 @@
 """HunyuanImage-3.0 Pipeline for sglang-diffusion.
 
 HunyuanImage-3.0 uses a non-standard Diffusers format: config and all
-component weights live at the repo root.  The pipeline therefore loads the
-flat checkpoint directly instead of using Diffusers component subdirectories.
+component weights live at the repo root.  The pipeline loads the
+checkpoint with a single streaming pass — DiT weights stream directly
+from disk into ``model.load_weights()`` without materializing the full
+checkpoint, while VAE / vision weights are buffered into small dicts.
+Peak CPU memory ≈ 1 shard + small auxiliary dicts.
 
-Weight loading follows the same pattern as ``Hunyuan3DPipeline``: load all
-shards into a single dict, then dispatch to each component.
+Pattern from ComfyUI pipelines' streaming weight loading and SRT's
+``buffered_multi_thread_safetensors_weights_iterator`` bounded-memory
+approach (``srt/model_loader/weight_utils.py:1034``).
 """
 
 import glob
@@ -33,19 +37,16 @@ from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3 import (
     HunyuanImage3BeforeDenoisingStage,
-    HunyuanImage3DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint resolution (ref: Hunyuan3DPipeline._resolve_shape_dir)
-# ---------------------------------------------------------------------------
 
 
 def _resolve_hunyuan_image3_checkpoint(model_path: str) -> str:
@@ -70,25 +71,52 @@ def _list_hunyuan_image3_safetensors(model_path: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Single-pass loading (ref: Hunyuan3DPipeline._load_and_split_checkpoint)
+# Streaming weight routing (ref: ComfyUI pipelines, SRT weight_utils)
 # ---------------------------------------------------------------------------
 
 # Prefixes that belong to VAE / vision encoder, NOT the transformer.
 _NON_TRANSFORMER_PREFIXES = ("vae.", "vision_model.", "vision_aligner.")
 
 
-def _load_flat_checkpoint(
+def _route_checkpoint_weights(
     safetensors_files: list[str],
-) -> dict[str, torch.Tensor]:
-    """Load all shards into a single flat dict (key → tensor).
+    non_transformer_prefixes: tuple[str, ...] = _NON_TRANSFORMER_PREFIXES,
+) -> tuple:
+    """Stream checkpoint weights, routing DiT vs auxiliary (VAE/vision).
 
-    Preserves the ORIGINAL checkpoint key names so that the transformer's
-    ``param_names_mapping`` regexes work correctly.
+    Returns a (dit_generator, auxiliary_dict) pair where:
+    - ``dit_generator`` yields raw (name, tensor) for transformer weights
+    - ``auxiliary_dict`` is {"vae": {name: tensor}, "vision_model": {...}, ...}
+      and is populated as dit_generator is consumed.
 
-    Uses ``safetensors_weights_iterator`` so the standard tqdm progress bar
-    is shown automatically (same as ComfyUI pipelines and base class loader).
+    Peak CPU memory ≈ 1 shard at a time + auxiliary dicts (small components).
+    The auxiliary dicts are small (~hundreds of MB) because VAE/vision are
+    much smaller than the DiT (~20B params).
+
+    Refs:
+    - ComfyUI pipelines' streaming: ``comfyui_flux_pipeline.py:158``
+    - SRT bounded-memory loader: ``srt/model_loader/weight_utils.py:1034``
     """
-    return dict(safetensors_weights_iterator(safetensors_files))
+    auxiliary: dict[str, dict[str, torch.Tensor]] = {}
+
+    def _dit_stream():
+        # Stream shard-by-shard; VAE/vision weights buffered, DiT yielded.
+        for name, tensor in safetensors_weights_iterator(safetensors_files):
+            for prefix in non_transformer_prefixes:
+                if name.startswith(prefix):
+                    key = prefix.rstrip(".")
+                    aux = auxiliary.get(key)
+                    if aux is None:
+                        aux = {}
+                        auxiliary[key] = aux
+                    # Strip prefix before storing.
+                    aux[name[len(prefix) :]] = tensor
+                    break
+            else:
+                # Not auxiliary → yield to DiT loader (streaming).
+                yield name, tensor
+
+    return _dit_stream(), auxiliary
 
 
 # ---------------------------------------------------------------------------
@@ -100,19 +128,15 @@ def _load_dit_model(
     model_cls,
     dit_config,
     hf_config: dict[str, Any],
-    flat_weights: dict[str, torch.Tensor],
+    weight_stream,
     device: torch.device,
     server_args: ServerArgs,
 ) -> torch.nn.Module:
-    """Load the DiT model (ref: ``Hunyuan3DPipeline._load_dit_model``).
+    """Load the DiT model with streaming weights (ref: ComfyUI pipelines).
 
-    HunyuanImage3's flat checkpoint stores transformer weights under
-    **multiple** top-level prefixes (``model.``, ``patch_embed.``, ``lm_head.``,
-    ``time_embed.``, etc.).  All of these must be passed to the transformer's
-    ``load_weights`` — only ``vae.`` and ``vision_*`` keys are excluded.
-
-    The original key names are preserved so that ``param_names_mapping``
-    regexes (e.g. ``^model\\.(.*)$``) match correctly.
+    ``weight_stream`` is a generator yielding (name, tensor) for transformer
+    weights only.  Names are in the ORIGINAL checkpoint format so that
+    ``param_names_mapping`` regexes match correctly.
     """
     param_dtype = torch.bfloat16
     with set_default_torch_dtype(param_dtype):
@@ -121,11 +145,8 @@ def _load_dit_model(
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     weight_converter = getattr(model, "convert_checkpoint_weight_for_loading", None)
 
-    def _weight_iterator():
-        for name, tensor in flat_weights.items():
-            # Skip VAE / vision encoder keys — they are loaded separately.
-            if name.startswith(_NON_TRANSFORMER_PREFIXES):
-                continue
+    def _mapped_weight_stream():
+        for name, tensor in weight_stream:
             target_name, _, _ = param_names_mapping_fn(name)
             if weight_converter is not None:
                 tensor = weight_converter(
@@ -135,18 +156,18 @@ def _load_dit_model(
                 )
             yield target_name, tensor
 
-    model.load_weights(_weight_iterator())
+    model.load_weights(_mapped_weight_stream())
     model.post_load_weights()
     return model.eval()
 
 
 def _load_vae(
     pipeline_config,
-    flat_weights: dict[str, torch.Tensor],
+    vae_weights: dict[str, torch.Tensor],
     device: torch.device,
     local_model_path: str,
 ) -> torch.nn.Module:
-    """Load the VAE (ref: ``Hunyuan3DPipeline._load_simple_component``)."""
+    """Load the VAE from pre-filtered weights dict."""
     from sglang.multimodal_gen.configs.models.vaes.hunyuan_image3 import (
         HunyuanImage3VAEConfig,
     )
@@ -156,13 +177,6 @@ def _load_vae(
         vae_config = HunyuanImage3VAEConfig()
 
     vae = AutoencoderKLConv3D(vae_config).to(device=device, dtype=torch.float32)
-
-    prefix = "vae."
-    vae_weights = {
-        key[len(prefix):]: tensor
-        for key, tensor in flat_weights.items()
-        if key.startswith(prefix)
-    }
     if vae_weights:
         vae.load_state_dict(vae_weights, strict=False)
     logger.info("Loaded VAE from %s", local_model_path)
@@ -171,10 +185,10 @@ def _load_vae(
 
 def _load_image_encoder(
     hf_config: dict[str, Any],
-    flat_weights: dict[str, torch.Tensor],
+    auxiliary_weights: dict[str, dict[str, torch.Tensor]],
     device: torch.device,
 ) -> dict[str, Any]:
-    """Load the vision encoder and aligner (ref: ``Hunyuan3DPipeline._load_simple_component``)."""
+    """Load the vision encoder and aligner from pre-filtered weights dicts."""
     vit_config = hf_config.get("vit", None)
     if vit_config is None:
         raise ValueError(
@@ -191,12 +205,7 @@ def _load_image_encoder(
     vision_model = Siglip2VisionTransformer(vit_config).to(
         device=device, dtype=torch.bfloat16
     )
-    prefix = "vision_model."
-    vision_weights = {
-        key[len(prefix):]: tensor
-        for key, tensor in flat_weights.items()
-        if key.startswith(prefix)
-    }
+    vision_weights = auxiliary_weights.get("vision_model", {})
     if vision_weights:
         vision_model.load_state_dict(vision_weights, strict=False)
 
@@ -206,12 +215,7 @@ def _load_image_encoder(
         vision_aligner = LightProjector(vit_aligner_config).to(
             device=device, dtype=torch.bfloat16
         )
-        prefix = "vision_aligner."
-        aligner_weights = {
-            key[len(prefix):]: tensor
-            for key, tensor in flat_weights.items()
-            if key.startswith(prefix)
-        }
+        aligner_weights = auxiliary_weights.get("vision_aligner", {})
         if aligner_weights:
             vision_aligner.load_state_dict(aligner_weights, strict=False)
 
@@ -252,10 +256,16 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, Any]:
-        """Load HunyuanImage-3.0 components from the flat checkpoint layout.
+        """Load HunyuanImage-3.0 components with streaming weight loading.
 
-        Follows ``Hunyuan3DPipeline.load_modules`` pattern: load all shards
-        once, then dispatch to component loaders.
+        HY3 stores all component weights in one set of safetensors files
+        (non-standard layout).  We use a single streaming pass:
+        - DiT weights stream directly from disk into ``model.load_weights()``
+        - VAE / vision weights are buffered into small dicts
+
+        Peak CPU memory ≈ 1 shard + auxiliary dicts (small components).
+        Follows the same streaming pattern as ``TransformerLoader`` and
+        ``TextEncoderLoader`` in the sglang loader framework.
         """
         from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
             get_diffusers_component_config,
@@ -275,10 +285,9 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             trust_remote_code=server_args.trust_remote_code,
         )
 
-        # --- Single-pass load (ref: Hunyuan3DPipeline) ---
-        flat_weights = _load_flat_checkpoint(safetensors_files)
+        # DiT weights stream from disk; VAE/vision buffered into small dicts.
+        dit_stream, auxiliary = _route_checkpoint_weights(safetensors_files)
 
-        # Transformer
         from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 
         transformer_config = dict(hf_config)
@@ -293,15 +302,15 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
             model_cls=model_cls,
             dit_config=dit_config,
             hf_config=transformer_config,
-            flat_weights=flat_weights,
+            weight_stream=dit_stream,
             device=device,
             server_args=server_args,
         )
 
-        # VAE
+        # VAE (from small buffered dict)
         components["vae"] = _load_vae(
             server_args.pipeline_config,
-            flat_weights=flat_weights,
+            vae_weights=auxiliary.get("vae", {}),
             device=device,
             local_model_path=local_model_path,
         )
@@ -313,19 +322,14 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         # Image encoder (optional, for TI2I).
-        # Enabled when user passes --component-paths.image_encoder.
-        # The weights are loaded from the same flat checkpoint; no separate
-        # path is needed because HY3 stores all components in one shard set.
         if "image_encoder" in server_args.component_paths:
             components["image_encoder"] = _load_image_encoder(
                 hf_config,
-                flat_weights=flat_weights,
+                auxiliary_weights=auxiliary,
                 device=device,
             )
 
-        # Release checkpoint dict to free CPU memory.
-        flat_weights.clear()
-
+        # auxiliary dict released automatically when this frame exits.
         logger.info(
             "HunyuanImage3Pipeline loaded all components from %s",
             local_model_path,
@@ -350,7 +354,7 @@ class HunyuanImage3Pipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
         self.add_stage(
-            HunyuanImage3DenoisingStage(
+            DenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
             ),

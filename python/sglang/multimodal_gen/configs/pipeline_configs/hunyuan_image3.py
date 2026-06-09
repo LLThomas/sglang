@@ -117,6 +117,17 @@ class HunyuanImage3PipelineConfig(ImagePipelineConfig):
     def post_denoising_loop(self, latents, batch):
         return latents.to(torch.bfloat16)
 
+    # -- Sequence Parallelism --------------------------------------------------
+    # HY3 does not use Sequence Parallelism (SP handled by TP).  Latents remain
+    # [B, C, H, W] on every rank, so the base-class sharding/gathering must be
+    # overridden as no-ops.
+
+    def shard_latents_for_sp(self, batch, latents):
+        return latents, False
+
+    def gather_latents_for_sp(self, latents, batch=None):
+        return latents
+
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         """Add temporal dimension for 3D VAE decode.
 
