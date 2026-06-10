@@ -1103,23 +1103,10 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
                 "AR generation is not supported in this version. Please leave bot_task empty."
             )
 
-        image_size = getattr(batch, "image_size", None) or None
-        # Phase 1: if image_size is provided and is "auto", raise error
-        if image_size is not None and self._is_auto_image_size(image_size):
-            raise ValueError(
-                "Auto image size requires AR generation (not supported in this version). "
-                "Please specify explicit image_size like '1024x1024' via --config, "
-                "or use --height and --width directly."
-            )
-
-        # Parse image_size if provided, otherwise use batch.height/batch.width
-        requested_width, requested_height, requested_ratio_index = None, None, None
-        if image_size is not None:
-            requested_width, requested_height, requested_ratio_index = (
-                self._parse_requested_image_size(image_size)
-            )
-            if requested_ratio_index is not None:
-                batch.ratio_index = requested_ratio_index
+        # Phase 1: use height/width directly. image_size is ignored (Phase 2 feature).
+        # If user needs explicit ratio_index, they can set it directly via --config.
+        height = batch.height
+        width = batch.width
 
         # 1. Parse inputs from batch
         prompt = _first_prompt(batch.prompt)
@@ -1128,16 +1115,11 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
         system_prompt = ""  # Phase 1: system prompt is always empty
         template = getattr(batch, "sequence_template", "pretrain") or "pretrain"
 
-        height = batch.height
-        width = batch.width
-        if requested_width is not None and requested_height is not None:
-            width = requested_width
-            height = requested_height
         guidance_scale = batch.guidance_scale
         num_inference_steps = batch.num_inference_steps
         seed = batch.seed
 
-        # 1b. If ratio_index was specified via image_size, override height/width
+        # 1b. If ratio_index was set via config, use it to override height/width
         if hasattr(batch, "ratio_index") and batch.ratio_index is not None:
             reso = self.resolution_group[batch.ratio_index]
             height = reso.h
