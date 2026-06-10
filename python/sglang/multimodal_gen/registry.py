@@ -58,6 +58,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan_image3 import (
+    HunyuanImage3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
     Ideogram4PipelineConfig,
 )
@@ -109,6 +112,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.hunyuan_image3 import (
+    HunyuanImage3SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
@@ -947,6 +953,17 @@ def _register_configs():
             "tencent/Hunyuan3D-2",
         ],
         model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
+    )
+
+    # HunyuanImage-3.0
+    register_configs(
+        sampling_param_cls=HunyuanImage3SamplingParams,
+        pipeline_config_cls=HunyuanImage3PipelineConfig,
+        hf_model_paths=[
+            "tencent/HunyuanImage-3.0",
+            "tencent/HunyuanImage-3.0-Instruct",
+        ],
+        model_detectors=[lambda hf_id: "hunyuanimage-3" in hf_id.lower()],
     )
 
     # Helios
