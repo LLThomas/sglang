@@ -1103,20 +1103,23 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
                 "AR generation is not supported in this version. Please leave bot_task empty."
             )
 
-        image_size = getattr(batch, "image_size", "auto") or "auto"
-
-        # Phase 1 validation: auto image size requires AR generation
-        if self._is_auto_image_size(image_size):
+        image_size = getattr(batch, "image_size", None) or None
+        # Phase 1: if image_size is provided and is "auto", raise error
+        if image_size is not None and self._is_auto_image_size(image_size):
             raise ValueError(
                 "Auto image size requires AR generation (not supported in this version). "
-                "Please specify explicit image_size like '1024x1024'."
+                "Please specify explicit image_size like '1024x1024' via --config, "
+                "or use --height and --width directly."
             )
 
-        requested_width, requested_height, requested_ratio_index = (
-            self._parse_requested_image_size(image_size)
-        )
-        if requested_ratio_index is not None:
-            batch.ratio_index = requested_ratio_index
+        # Parse image_size if provided, otherwise use batch.height/batch.width
+        requested_width, requested_height, requested_ratio_index = None, None, None
+        if image_size is not None:
+            requested_width, requested_height, requested_ratio_index = (
+                self._parse_requested_image_size(image_size)
+            )
+            if requested_ratio_index is not None:
+                batch.ratio_index = requested_ratio_index
 
         # 1. Parse inputs from batch
         prompt = _first_prompt(batch.prompt)
