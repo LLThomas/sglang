@@ -23,6 +23,14 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.dits.hunyuan_image3 import (
     HunyuanImage3DiTConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_group,
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sequence_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
@@ -990,7 +998,7 @@ class HunYuanAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             softmax_scale=self.scaling,
             causal=False,
-            skip_sequence_parallel=True,  # HY3: SP handled by TP
+            skip_sequence_parallel=False,
             supported_attention_backends=supported_attention_backends,
         )
 
@@ -1048,12 +1056,42 @@ class HunYuanAttention(nn.Module):
         k_backend = k.transpose(1, 2)
         v_backend = v.transpose(1, 2)
 
+        # Sequence Parallelism + 4D causal mask handling:
+        # USPAttention's SP path only supports 2D [B, S_local] masks.
+        # When SP is enabled with a 4D mask, we gather KV across SP ranks
+        # and skip SP for this attention call, following the LTX-2 pattern.
+        sp_size = get_sequence_parallel_world_size()
+        skip_sp_override = False
+        if attention_mask is not None and sp_size > 1:
+            # Gather k/v across SP ranks so each rank sees the full sequence
+            k_backend = sequence_model_parallel_all_gather(
+                k_backend.contiguous(), dim=1
+            )
+            v_backend = sequence_model_parallel_all_gather(
+                v_backend.contiguous(), dim=1
+            )
+            # The mask is also sharded by SP; gather to match the full KV length
+            if attention_mask.dim() == 4:
+                # 4D mask [B, 1, seq_len, seq_len] -> gather the last dim
+                gathered_mask = sequence_model_parallel_all_gather(
+                    attention_mask, dim=3
+                )
+                attention_mask = gathered_mask
+            elif attention_mask.dim() == 2:
+                # 2D mask [B, seq_len] -> gather dim 1
+                gathered_mask = sequence_model_parallel_all_gather(
+                    attention_mask, dim=1
+                )
+                attention_mask = gathered_mask
+            skip_sp_override = True
+
         with _maybe_forward_context():
             attn_output = self.attn(
                 q_backend,
                 k_backend,
                 v_backend,
                 attn_mask=attention_mask,
+                skip_sequence_parallel_override=skip_sp_override,
             )
 
         # [B, L, H_local, D_h] -> [B, L, H_local*D_h]
@@ -1426,11 +1464,12 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._supported_attention_backends = arch._supported_attention_backends
 
         head_dim = arch.attention_head_dim
-        num_kv_heads = getattr(arch, "num_key_value_heads", arch.num_attention_heads)
-        if num_kv_heads is None:
-            num_kv_heads = arch.num_attention_heads
+        num_kv_heads = arch.num_key_value_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+
+        # Sequence parallelism
+        self.sp_size = get_sp_world_size()
 
         # Token embedding / LM head use vocab parallelism to match the TP
         # execution style used by SGLang language models.
@@ -1450,22 +1489,20 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             [
                 HunyuanImage3DecoderLayer(
                     hidden_size=arch.hidden_size,
-                    intermediate_size=getattr(arch, "intermediate_size", None)
-                    or int(arch.hidden_size * getattr(arch, "mlp_ratio", 4.0)),
+                    intermediate_size=arch.intermediate_size
+                    or int(arch.hidden_size * arch.mlp_ratio),
                     num_heads=arch.num_attention_heads,
                     num_kv_heads=num_kv_heads,
                     head_dim=head_dim,
-                    use_qk_norm=getattr(arch, "qk_norm", "rms_norm") == "rms_norm",
-                    rms_norm_eps=getattr(arch, "rms_norm_eps", 1e-5),
-                    attention_bias=getattr(arch, "attention_bias", False),
+                    use_qk_norm=arch.qk_norm == "rms_norm",
+                    rms_norm_eps=arch.rms_norm_eps,
+                    attention_bias=arch.attention_bias,
                     num_experts=_maybe_list(arch.num_experts, i),
                     moe_topk=_maybe_list(arch.moe_topk, i),
                     num_shared_expert=_maybe_list(arch.num_shared_expert, i),
-                    moe_intermediate_size=_maybe_list(
-                        getattr(arch, "moe_intermediate_size", None), i
-                    ),
+                    moe_intermediate_size=_maybe_list(arch.moe_intermediate_size, i),
                     layer_idx=i,
-                    moe_layer_num_skipped=getattr(arch, "moe_layer_num_skipped", 0),
+                    moe_layer_num_skipped=arch.moe_layer_num_skipped,
                     supported_attention_backends=self._supported_attention_backends,
                     alt_stream=self.alt_stream,
                     quant_config=quant_config,
@@ -1476,7 +1513,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.layer_names = ["layers"]
 
         # Final norm
-        self.norm = RMSNorm(arch.hidden_size, eps=getattr(arch, "rms_norm_eps", 1e-5))
+        self.norm = RMSNorm(arch.hidden_size, eps=arch.rms_norm_eps)
 
         # AR text generation head (independent weights, not tied to embed_tokens)
         self.lm_head = VocabParallelEmbedding(
@@ -1485,7 +1522,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             org_num_embeddings=self.vocab_size,
             prefix="lm_head",
         )
-        if getattr(arch, "tie_word_embeddings", False):
+        if arch.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
         self._lm_head_mapping: torch.Tensor | None = None
 
@@ -1746,6 +1783,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         path is a no-op for single-token decode.
         """
         hidden_states = self.embed_tokens(input_ids)
+        bsz = hidden_states.shape[0]
 
         # -- Inject cond vision features (ti2i AR prefill only) --
         # Mirrors DiT forward steps 5-6 (lines 1909-1945).
@@ -1940,8 +1978,32 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         # 7. Apply 2D RoPE
         hidden = inputs_embeds
 
-        # 8. TeaCache: optionally skip the transformer layers
+        # 8. Sequence Parallelism: shard hidden states across SP ranks
         forward_batch = get_forward_context().forward_batch
+        sequence_shard_enabled = (
+            forward_batch is not None
+            and forward_batch.enable_sequence_shard
+            and self.sp_size > 1
+        )
+
+        seq_len_orig = hidden.shape[1]
+        seq_shard_pad = 0
+        if sequence_shard_enabled:
+            if seq_len_orig % self.sp_size != 0:
+                seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
+                pad = torch.zeros(
+                    (bsz, seq_shard_pad, hidden.shape[2]),
+                    dtype=hidden.dtype,
+                    device=hidden.device,
+                )
+                hidden = torch.cat([hidden, pad], dim=1)
+
+            sp_rank = get_sp_group().rank_in_group
+            local_seq_len = hidden.shape[1] // self.sp_size
+            hidden = hidden.view(bsz, self.sp_size, local_seq_len, hidden.shape[2])
+            hidden = hidden[:, sp_rank, :, :]
+
+        # 9. TeaCache: optionally skip the transformer layers
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache
         )
@@ -1968,6 +2030,13 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 self.maybe_cache_states(hidden, original_hidden)
 
         self.cnt += 1
+
+        # All-gather hidden states across SP ranks if sequence sharding was enabled
+        if sequence_shard_enabled:
+            hidden = hidden.contiguous()
+            hidden = sequence_model_parallel_all_gather(hidden, dim=1)
+            if seq_shard_pad > 0:
+                hidden = hidden[:, :seq_len_orig, :]
 
         # 10. Final norm (always runs — cheap, no reason to cache)
         hidden = self.norm(hidden)
@@ -2088,6 +2157,11 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         lower-triangular bool mask, subsequent steps pass None (single
         token with KV cache needs no mask).
 
+        Note: AR generation temporarily disables sequence parallelism because
+        causal attention masks are incompatible with SP's sequence sharding.
+        All TP ranks generate identical tokens (greedy by default), so no
+        cross-rank synchronization is needed beyond the existing TP all-reduce.
+
         Args:
             input_ids: Token IDs [1, seq_len].
             rope_2d: Tuple of (cos, sin) for 2D RoPE.
@@ -2105,6 +2179,67 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         Returns:
             Generated token IDs [1, seq_len + num_generated].
         """
+        # Temporarily disable sequence parallelism for AR generation.
+        # Causal attention masks require full-sequence visibility, which is
+        # incompatible with SP's sequence sharding. This follows the pattern
+        # used by other models (e.g., vllm-omni separates AR/DiT stages).
+        original_skip_sp_values = {}
+        for layer_idx, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            if hasattr(attn, "attn") and hasattr(attn.attn, "skip_sequence_parallel"):
+                original_skip_sp_values[layer_idx] = attn.attn.skip_sequence_parallel
+                attn.attn.skip_sequence_parallel = True
+
+        try:
+            return self._generate_text_impl(
+                input_ids=input_ids,
+                rope_2d=rope_2d,
+                position_ids=position_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                eos_token_id=eos_token_id,
+                stop_token_ids=stop_token_ids,
+                logits_processor=logits_processor,
+                progress_log_interval=progress_log_interval,
+                cond_vae_images=cond_vae_images,
+                cond_timestep=cond_timestep,
+                cond_vae_scatter_index=cond_vae_scatter_index,
+                cond_vit_embeds=cond_vit_embeds,
+                cond_vit_scatter_index=cond_vit_scatter_index,
+                cond_timestep_scatter_index=cond_timestep_scatter_index,
+                image_infos=image_infos,
+                prefill_attention_mask=prefill_attention_mask,
+            )
+        finally:
+            # Restore original skip_sequence_parallel values
+            for layer_idx, original_value in original_skip_sp_values.items():
+                self.layers[layer_idx].self_attn.attn.skip_sequence_parallel = original_value
+
+    def _generate_text_impl(
+        self,
+        input_ids: torch.Tensor,
+        rope_2d: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.Tensor | None = None,
+        max_new_tokens: int = 2048,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 1,
+        eos_token_id: int | None = None,
+        stop_token_ids: list[int] | None = None,
+        logits_processor=None,
+        progress_log_interval: int = 16,
+        cond_vae_images: torch.Tensor | None = None,
+        cond_timestep: torch.Tensor | None = None,
+        cond_vae_scatter_index: torch.Tensor | None = None,
+        cond_vit_embeds: torch.Tensor | None = None,
+        cond_vit_scatter_index: torch.Tensor | None = None,
+        cond_timestep_scatter_index: torch.Tensor | None = None,
+        image_infos=None,
+        prefill_attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Internal implementation of AR text generation (SP already disabled)."""
         device = input_ids.device
         start_time = time.perf_counter()
         input_seq_len = input_ids.shape[1]

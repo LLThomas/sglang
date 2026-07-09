@@ -69,6 +69,7 @@ class HunyuanImage3ArchConfig(DiTArchConfig):
     )
     # patch_embed / final_layer
     patch_embed_hidden_dim: int = 1024
+    mlp_ratio: float = 4.0
     # Timestep embedders
     timestep_embed_dim: int = 4096
     # Special token IDs from config.json
