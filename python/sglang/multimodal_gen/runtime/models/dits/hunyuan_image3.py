@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -57,6 +58,7 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
+    get_tp_group,
 )
 from sglang.srt.utils import is_cuda, is_npu
 
@@ -1140,13 +1142,12 @@ class HunYuanMLP(nn.Module):
 
 
 class HunYuanSparseMoeBlock(nn.Module):
-    """Sparse MoE block backed by SRT's FusedMoE + TopK.
+    """Sparse MoE block using SRT standard FusedMoE.
 
-    Delegates all expert computation (routing, dispatch, fused kernel
-    execution, combine) to SRT's high-performance MoE stack, which
-    auto-selects the best kernel per platform (Triton on GPU, ascend_fuseep
-    or grouped-matmul on NPU).  Expert Parallelism is fully supported via
-    the bridge initialised in ``srt_moe_bridge``.
+    Architecture:
+    - Router gate and TopK are computed HERE (FP32 for HF parity)
+    - FusedMoE does dispatch + expert computation + combine
+    - Supports EP > 1 on GPU platform (NPU: EP=1 only)
     """
 
     def __init__(
@@ -1163,18 +1164,13 @@ class HunYuanSparseMoeBlock(nn.Module):
         quant_config=None,
     ):
         super().__init__()
+
+        # Use SRT standard FusedMoE directly
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopK
 
-        # Lazily initialize SRT MoE config on first MoE layer creation.
-        # Parallel groups are already set up at launch time; this only
-        # sets MoE-specific globals (MOE_A2A_BACKEND, etc.).
-        from sglang.multimodal_gen.runtime.distributed.srt_moe_bridge import (
-            init_srt_moe_config,
-        )
-        init_srt_moe_config()
-
         self.alt_stream = alt_stream
+        self.top_k = top_k
 
         # FP32 router gate (replicated on all ranks)
         self.gate = ReplicatedLinear(
@@ -1185,39 +1181,27 @@ class HunYuanSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate" if prefix else "gate",
         )
 
-        # SRT fused TopK (GPU: sgl_kernel.topk_softmax; NPU: npu_moe_gating_top_k_softmax)
-        self.topk = TopK(top_k=top_k, renormalize=True, scoring_func="softmax")
-
-        # NOTE: ``reduce_results`` must be ``False`` for DeepEP (and any
-        # other all-to-all dispatcher such as Mooncake / NIXL / Mori).
-        # These dispatchers handle cross-rank token routing entirely
-        # inside their own ``dispatch`` / ``combine`` phases — the
-        # combine step already returns the complete weighted sum of
-        # expert outputs for every input token on each rank.  An extra
-        # ``all_reduce`` would multiply the result by ``ep_size`` and
-        # corrupt the output.  For StandardDispatcher + TP the
-        # all-reduce is still needed and is handled inside FusedMoE via
-        # ``reduce_results=True``.
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-        a2a_backend = get_moe_a2a_backend()
-        self._use_deepep_or_similar = (
-            a2a_backend.is_deepep()
-            or a2a_backend.is_mooncake()
-            or a2a_backend.is_nixl()
-            or a2a_backend.is_mori()
+        # TopK routing
+        self.topk = TopK(
+            top_k=top_k,
+            layer_id=layer_id,
+            renormalize=True,
         )
 
-        # SRT FusedMoE — owns w13/w2 weights, dispatch, fused kernels, combine
+        # FusedMoE - standard SRT implementation
+        # When EP=1: all experts are local, TP handles distribution
+        # When EP>1 (GPU only): experts distributed across EP ranks
+        # reduce_results=True: SRT handles all-reduce internally using SRT's TP group
+        #   (which now matches multimodal_gen's TP group: TP=4, PP=CFG=2)
         self.experts = FusedMoE(
             num_experts=num_experts,
+            top_k=top_k,
+            layer_id=layer_id,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            layer_id=layer_id,
-            top_k=top_k,
-            reduce_results=not self._use_deepep_or_similar,
             quant_config=quant_config,
             prefix=f"{prefix}.experts" if prefix else "experts",
+            reduce_results=True,  # Use SRT's internal all-reduce
         )
 
         # Shared expert
@@ -1235,31 +1219,43 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
-        # FP32 router
+        # FP32 router gate (replicated on all ranks)
+        # Match HF reference: gate runs in FP32 for byte-level accuracy
         router_logits, _ = self.gate(hidden_states_flat.float())
-        topk_output = self.topk(hidden_states_flat, router_logits)
 
-        if self.alt_stream is not None and self.shared_mlp is not None:
-            # Dual-stream: shared_mlp on main stream, experts on alt stream
-            current_stream = torch.cuda.current_stream()
-            shared_output = self.shared_mlp(hidden_states)
+        # FP32 softmax + topk + renormalization - matches HF exactly
+        # This bypasses NPU's fused topk kernel which has numerical differences
+        gates = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_indices = torch.topk(gates, self.top_k, dim=-1)
 
-            self.alt_stream.wait_stream(current_stream)
-            with torch.cuda.stream(self.alt_stream):
-                routed_output = self.experts(
-                    hidden_states_flat, topk_output
-                ).view(orig_shape)
-            current_stream.wait_stream(self.alt_stream)
+        # Renormalize with clamp-divide (HF parity: clamp(min=1e-8))
+        weight_sums = topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / weight_sums.clamp(min=1e-8)
 
-            output = routed_output + shared_output
-        else:
-            # Single-stream: sequential execution
-            routed_output = self.experts(
-                hidden_states_flat, topk_output
-            ).view(orig_shape)
-            output = routed_output
-            if self.shared_mlp is not None:
-                output = output + self.shared_mlp(hidden_states)
+        # Cast weights to model dtype for expert computation
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
+        # CRITICAL: Cast indices to int32 (FusedMoE expects int32, not int64 from torch.topk)
+        # This matches vllm-omni's _hunyuan_image3_unpack_packed_topk behavior
+        topk_indices = topk_indices.to(torch.int32)
+
+        # Pack into StandardTopKOutput format expected by FusedMoE
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_indices,
+            router_logits=router_logits,
+        )
+
+        # Forward through FusedMoE (standard SRT implementation)
+        # reduce_results=True: SRT handles all-reduce internally
+        routed_output = self.experts(hidden_states_flat, topk_output)
+
+        # Handle shared expert if present
+        output = routed_output.view(orig_shape)
+        if self.shared_mlp is not None:
+            shared_out = self.shared_mlp(hidden_states)
+            output = output + shared_out
 
         return output
 
@@ -1306,6 +1302,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
         )
 
         use_moe = num_experts > 1 and layer_idx >= moe_layer_num_skipped
+        self.layer_idx = layer_idx
         if use_moe:
             moe_inter = moe_intermediate_size or intermediate_size
             self.mlp = HunYuanSparseMoeBlock(
@@ -1560,7 +1557,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self._routed_expert_pattern = re.compile(
-            r"^(?P<prefix>.*?\.mlp)\.experts\.(?P<expert_id>\d+)\.(?P<proj>gate_up_proj|down_proj)\.weight$"
+            r"^(?P<prefix>.*?\.mlp)\.experts\.(?P<expert_id>\d+)\.(?P<proj>gate_up_proj|gate_and_up_proj|down_proj)\.weight$"
         )
         self._teacache_skipped_steps = 0
 
@@ -1570,12 +1567,9 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         name: str,
         loaded_weight: torch.Tensor,
     ) -> str | None:
-        """Load routed expert weights via SRT FusedMoE's weight_loader.
+        """Load routed expert weights using SRT FusedMoE's weight_loader.
 
-        Checkpoint naming: ``layers.X.mlp.experts.{i}.gate_up_proj.weight``
-        and ``layers.X.mlp.experts.{i}.down_proj.weight`` are remapped to
-        FusedMoE's ``w13_weight`` / ``w2_weight`` using shard IDs
-        ``w1``/``w3`` (gate/up halves) / ``w2``.
+        Simplified: Use SRT's standard weight loading approach.
         """
         routed_match = self._routed_expert_pattern.match(name)
         if routed_match is None:
@@ -1585,12 +1579,13 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
         expert_id = int(routed_match.group("expert_id"))
         proj = routed_match.group("proj")
 
-        if proj == "gate_up_proj":
+        # Map to FusedMoE parameter names
+        if proj in ("gate_and_up_proj", "gate_up_proj"):
             target_name = f"{prefix}.experts.w13_weight"
-            # gate_up_proj is [2*intermediate, hidden]; split into gate (w1)
-            # and up (w3) halves for FusedMoE's weight_loader which accepts
-            # shard_id in ("w1", "w2", "w3").
+
+            # Split gate_and_up_proj into gate (w1) and up (w3) halves
             gate_weight, up_weight = loaded_weight.chunk(2, dim=0)
+
             for shard_id, weight in [("w1", gate_weight), ("w3", up_weight)]:
                 param = params_dict.get(target_name)
                 if param is None:
@@ -1599,17 +1594,15 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 if weight_loader is not None:
                     weight_loader(param, weight, target_name, shard_id, expert_id)
             return target_name
-        else:
+        else:  # down_proj
             target_name = f"{prefix}.experts.w2_weight"
-            shard_id = "w2"
-
-        param = params_dict.get(target_name)
-        if param is None:
+            param = params_dict.get(target_name)
+            if param is None:
+                return target_name
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader is not None:
+                weight_loader(param, loaded_weight, target_name, "w2", expert_id)
             return target_name
-        weight_loader = getattr(param, "weight_loader", None)
-        if weight_loader is not None:
-            weight_loader(param, loaded_weight, target_name, shard_id, expert_id)
-        return target_name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights from a checkpoint.
@@ -1739,12 +1732,14 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
 
     def _compute_ar_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states)
+
         if self.lm_head.tp_size <= 1:
             return logits[..., : self.vocab_size]
 
         logits = tensor_model_parallel_all_gather(
             logits, dim=-1, tp_group=self.lm_head.tp_group
         )
+
         if (
             self._lm_head_mapping is None
             or self._lm_head_mapping.device != logits.device
@@ -1756,6 +1751,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 )
         if self._lm_head_mapping is not None:
             logits = logits.index_select(-1, self._lm_head_mapping)
+
         return logits[..., : self.vocab_size]
 
     def _forward_ar_text(
@@ -1833,6 +1829,7 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 cache_position=cache_position,
                 cache_end=cache_end,
             )
+
         hidden_states = self.norm(hidden_states)
         logits = self._compute_ar_logits(hidden_states[:, -1, :])
         if use_cache:
@@ -2363,12 +2360,12 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             # rank independently picks the same token via argmax, so no
             # cross-rank broadcast is needed.  For non-greedy sampling, only
             # rank 0 draws a token and broadcasts it to avoid RNG divergence.
+            tp_rank = get_tensor_model_parallel_rank()
             if top_k == 1 or temperature <= 0:
                 next_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
                 next_token_id = int(next_token.item())
             else:
                 # Non-greedy: sample on rank 0 only, then broadcast.
-                tp_rank = get_tensor_model_parallel_rank()
                 if tp_rank == 0:
                     logits = logits / max(temperature, 1e-8)
                     top_k_val = min(top_k, logits.size(-1))
@@ -2393,9 +2390,12 @@ class HunyuanImage3DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                     next_token_id = int(next_token.item())
                 else:
                     next_token_id = 0  # placeholder, overwritten by broadcast
-                # Broadcast the chosen token to all TP ranks
+                # Broadcast the chosen token to all TP ranks within TP group only
+                # (not global world, which includes CFG parallel dimension)
                 token_tensor = torch.tensor([next_token_id], device=device)
-                dist.broadcast(token_tensor, src=0)
+                torch.distributed.broadcast(
+                    token_tensor, src=0, group=get_tp_group().device_group
+                )
                 next_token_id = int(token_tensor.item())
 
             next_token = torch.tensor(

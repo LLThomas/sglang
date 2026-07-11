@@ -221,6 +221,38 @@ class ServerArgs(DisaggServerArgsMixin):
     # MoE backend configuration (bridged to SRT's MoE stack)
     moe_a2a_backend: str = "none"
     moe_runner_backend: str = "auto"
+
+    # -------------------------------------------------------------------------
+    # SRT FusedMoE compatibility fields (elastic EP not used in diffusion)
+    # -------------------------------------------------------------------------
+    # These fields are accessed by SRT's FusedMoE layer. Diffusion uses EP=1,
+    # so elastic EP features are not applicable. Defaults match SRT's defaults.
+    ep_join_mode: str | None = None  # "scale" or "recover" for elastic EP
+    ep_join_rank_offset: int = 0
+    elastic_ep_initial_size: int | None = None
+
+    # -------------------------------------------------------------------------
+    # KTransformers/AMX expert parallelism (SRT FusedMoE compatibility)
+    # -------------------------------------------------------------------------
+    # These fields are required by SRT's FusedMoE for KT/AMX CPU offload.
+    # Defaults to None (disabled) for diffusion models.
+    kt_weight_path: str | None = None
+    kt_method: str = "AMXINT4"
+    kt_cpuinfer: int | None = None
+    kt_threadpool_count: int = 2
+    kt_num_gpu_experts: int | None = None
+    kt_max_deferred_experts_per_token: int | None = None
+    # chunked_prefill_size is required by KT config (diffusion models don't use prefill)
+    chunked_prefill_size: int | None = None
+
+    # -------------------------------------------------------------------------
+    # NCCL symmetric memory (SRT FusedMoE compatibility)
+    # -------------------------------------------------------------------------
+    # Required by FusedMoE's use_symmetric_memory context manager.
+    # Defaults to False (disabled) for diffusion models.
+    enable_symm_mem: bool = False
+    enable_torch_symm_mem: bool = False
+
     # number of gpu in a dp group
     dp_degree: int = 1
     # cfg parallel (None = auto-decide based on num_gpus)

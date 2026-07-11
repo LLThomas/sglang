@@ -99,6 +99,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         set_global_server_args(server_args=server_args)
 
+        # Also set SRT's global server args for FusedMoE compatibility
+        from sglang.srt.runtime_context import get_context
+        get_context().set_server_args(server_args)
+
+        # Initialize MoE flags for FusedMoE if MoE backend is configured
+        if server_args.moe_a2a_backend != "none":
+            from sglang.srt.layers.moe import initialize_moe_config
+            initialize_moe_config(server_args)
+
         # Inter-process Communication
         self.context = zmq.Context(io_threads=2)
         endpoint = server_args.scheduler_endpoint

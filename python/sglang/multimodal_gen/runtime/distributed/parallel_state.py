@@ -509,6 +509,37 @@ def get_dp_rank() -> int:
     return get_dp_group().rank_in_group
 
 
+def init_native_moe_config() -> None:
+    """Initialize MoE config if not already initialized.
+
+    This is a fallback for cases where scheduler didn't call initialize_moe_config.
+    """
+    from sglang.srt.layers.moe.utils import get_flags
+
+    # Skip if already initialized by scheduler
+    if get_flags().moe.a2a_backend is not None:
+        return
+
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+    from sglang.srt.layers.moe.utils import (
+        MoeA2ABackend,
+        MoeRunnerBackend,
+        DeepEPMode,
+    )
+
+    server_args = get_global_server_args()
+    moe = get_flags().moe
+    moe.a2a_backend = MoeA2ABackend(server_args.moe_a2a_backend)
+    moe.runner_backend = MoeRunnerBackend(server_args.moe_runner_backend)
+    moe.deepep_mode = DeepEPMode.NORMAL
+    moe.deepep_config = ""
+
+    logger.info(
+        "Native MoE config initialized: a2a_backend=%s, runner_backend=%s",
+        server_args.moe_a2a_backend, server_args.moe_runner_backend,
+    )
+
+
 def maybe_init_distributed_environment_and_model_parallel(
     tp_size: int,
     sp_size: int,
@@ -561,15 +592,45 @@ def maybe_init_distributed_environment_and_model_parallel(
         sequence_parallel_degree=sp_size,
     )
 
-    # Initialize SRT parallel groups so that diffusion MoE models can
-    # directly use SRT's FusedMoE / TopK layers.  This is lightweight —
-    # when ep_size=1 the MoE groups simply alias to _TP.  The MoE config
-    # globals (MOE_A2A_BACKEND, MOE_RUNNER_BACKEND, etc.) are initialized
-    # lazily when the model actually creates a FusedMoE instance.
-    from sglang.multimodal_gen.runtime.distributed.srt_moe_bridge import (
-        init_srt_parallel_groups,
+    # ---------------------------------------------------------------------------
+    # SRT Parallel State Initialization (for MoE models)
+    # ---------------------------------------------------------------------------
+    # NPU platform does not support EP > 1 (only TP for MoE).
+    # GPU platform supports EP > 1 for expert distribution.
+    from sglang.srt.utils import is_npu
+
+    if ep_size != 1 and is_npu():
+        raise NotImplementedError(
+            f"Expert Parallelism (EP) is not supported on NPU platform. "
+            f"Got ep_size={ep_size}. NPU only supports MoE Tensor Parallelism. "
+            f"Please use --tp-size {ep_size} instead."
+        )
+
+    from sglang.srt.distributed import parallel_state as srt_parallel_state
+
+    # CRITICAL: Initialize SRT parallel state for FusedMoE.
+    #
+    # SRT's parallel state is used by FusedMoE (get_parallel().moe_tp_size, etc.)
+    # while multimodal_gen's parallel state is used by VocabParallelEmbedding, etc.
+    # We must NOT replace multimodal_gen's _TP with SRT's _TP.
+    #
+    # Layout mapping:
+    # - SRT TP size = multimodal_gen TP size (tp_size)
+    # - SRT PP size = multimodal_gen CFG size (cfg_degree)
+    #   This makes SRT's PP groups match multimodal_gen's CFG groups:
+    #   TP=4, CFG=2 → SRT TP groups: [[0,1,2,3], [4,5,6,7]]
+    #                    SRT PP groups: [[0,4], [1,5], [2,6], [3,7]]
+    #
+    # With this mapping:
+    # - embed_tokens uses multimodal_gen's _TP (size=4) → vocab split 4 ways
+    # - FusedMoE uses SRT's moe_tp_size=4 → expert weights split 4 ways
+    # - Each PP stage (CFG group) loads the same weights → no OOM
+    # - AR text generation runs on cfg_rank=0 (PP rank 0) → correct all-reduce scope
+    srt_parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,  # Matches multimodal_gen TP
+        expert_model_parallel_size=ep_size,
+        pipeline_model_parallel_size=cfg_degree,  # CFG mapped to PP
     )
-    init_srt_parallel_groups(tp_size=tp_size, ep_size=ep_size)
 
     # Only set CUDA device if we're on a CUDA platform
     if current_platform.is_cuda_alike():
@@ -919,24 +980,3 @@ def destroy_model_parallel() -> None:
             torch.distributed.destroy_process_group(group)
 
     _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE = (None,) * 8
-
-    # Destroy srt MoE parallel groups that were initialised by
-    # ``_init_srt_moe_parallel_groups``.  We only tear down the groups
-    # we created; if srt's own ``initialize_model_parallel`` was called
-    # separately, srt's ``destroy_model_parallel`` handles those.
-    try:
-        import sglang.srt.distributed.parallel_state as srt_ps
-
-        # _MOE_EP aliases _TP, so only destroy _TP once.
-        if srt_ps._MOE_TP is not None and srt_ps._MOE_TP is not srt_ps._TP:
-            srt_ps._MOE_TP.destroy()
-        if srt_ps._TP is not None:
-            srt_ps._TP.destroy()
-        srt_ps._MOE_EP = None
-        srt_ps._MOE_TP = None
-        srt_ps._TP = None
-        if srt_ps._WORLD is not None:
-            srt_ps._WORLD.destroy()
-            srt_ps._WORLD = None
-    except ImportError:
-        pass
