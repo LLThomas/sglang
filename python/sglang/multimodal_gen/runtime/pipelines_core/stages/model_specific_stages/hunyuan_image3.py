@@ -1820,7 +1820,7 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             (cond_vae_images, cond_timestep, cond_vit_embeds, cond_image_info)
             where cond_image_info is a dict with token dimensions for sequence building.
         """
-        from sglang.multimodal_gen.runtime.models.vision_utils import load_image
+        from sglang.multimodal_gen.runtime.utils.vision import load_image
 
         # Load condition images
         image_path = getattr(batch, "image_path", None)
@@ -1898,11 +1898,29 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
             if vit_processor is not None and vision_model is not None:
                 vit_inputs = vit_processor(pil_image, return_tensors="pt")
                 pixel_values = vit_inputs["pixel_values"].to(device)
-                spatial_shapes = vit_inputs["spatial_shapes"].squeeze(0).to(device)
-                pixel_attention_mask = vit_inputs["pixel_attention_mask"].squeeze(0).to(device)
+                spatial_shapes = vit_inputs["spatial_shapes"].squeeze(0)  # keep on CPU
+                pixel_attention_mask = vit_inputs.get("pixel_attention_mask")
 
                 vit_token_h = int(spatial_shapes[0].item())
                 vit_token_w = int(spatial_shapes[1].item())
+                num_tokens = vit_token_h * vit_token_w
+
+                # Pack pixel_values into variable-length format for Siglip2VisionTransformer.
+                # processor outputs padding to max_tokens (e.g., 1024), but spatial_shapes
+                # indicates actual tokens (e.g., 30x32=960). Need to unpad.
+                if pixel_attention_mask is not None:
+                    # attention_mask is [1, max_tokens] or [max_tokens]
+                    pixel_attention_mask = pixel_attention_mask.squeeze(0).to(device)
+                    # Select valid tokens: [1, max_tokens, dim] -> [1, num_tokens, dim]
+                    pixel_values_packed = pixel_values[:, pixel_attention_mask.bool()]
+                else:
+                    # Fallback: truncate to num_tokens from spatial_shapes
+                    pixel_values_packed = pixel_values[:, :num_tokens]
+
+                # spatial_shapes: [H, W] -> need [1, 2] for batch (on CPU)
+                spatial_shapes_batch = spatial_shapes.unsqueeze(0)  # [1, 2] on CPU
+                cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32)  # CPU
+                max_seqlen = torch.tensor(num_tokens)  # CPU
 
                 # Run vision encoder + aligner in fp32 for numerical stability.
                 # The vision tower is loaded in bf16; on certain inputs (e.g. a
@@ -1922,12 +1940,12 @@ class HunyuanImage3BeforeDenoisingStage(PipelineStage):
                 if vision_aligner is not None:
                     vision_aligner.float()
                 with torch.autocast(device_type=device.type, enabled=False):
-                    vision_output = vision_model(
-                        pixel_values.float(),
-                        attention_mask=pixel_attention_mask.unsqueeze(0),
-                        spatial_shapes=spatial_shapes.unsqueeze(0),
+                    image_embed = vision_model(
+                        pixel_values_packed=pixel_values_packed.float(),
+                        spatial_shapes=spatial_shapes_batch,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
                     )
-                    image_embed = vision_output.last_hidden_state
                     if vision_aligner is not None:
                         image_embed = vision_aligner(image_embed)
                 vision_model.to(vm_dtype)

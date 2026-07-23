@@ -530,8 +530,8 @@ class Siglip2VisionTransformer(nn.Module):
 
         encoder_outputs = resolve_visual_encoder_outputs(
             encoder_outputs,
-            self.post_layernorm,
-            select_layers=select_layers,
+            feature_sample_layers=select_layers,
+            post_layer_norm=self.post_layernorm,
             max_possible_layers=self.config.num_hidden_layers,
         )
 
